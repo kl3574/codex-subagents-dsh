@@ -1,0 +1,6 @@
+interface:
+  display_name: "Codex subagents · DeepSeek Harness"
+  short_description: "Delegate scoped work to DeepSeek Harness with bounded progress"
+  default_prompt: "使用 $codex-subagents-dsh 把明确子任务交给 DeepSeek Harness；分别报告执行完成、任务验收和未解决错误。"
+policy:
+  allow_implicit_invocation: true
