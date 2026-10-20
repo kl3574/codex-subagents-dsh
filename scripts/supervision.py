@@ -434,6 +434,7 @@ class StatusPublisher:
         self.limit = limit
         self._device: int | None = None
         self._inode: int | None = None
+        self._last_document_bytes: bytes | None = None
         self._create(first_document)
 
     def _encode(self, document: dict[str, Any]) -> bytes:
@@ -465,6 +466,7 @@ class StatusPublisher:
                 raise SupervisionError("STATUS_FILE_REPLACED", "io")
             self._device = info.st_dev
             self._inode = info.st_ino
+            self._last_document_bytes = data
         except SupervisionError:
             raise
         except OSError:
@@ -490,6 +492,12 @@ class StatusPublisher:
         if (not stat.S_ISREG(before.st_mode)
                 or before.st_dev != self._device or before.st_ino != self._inode):
             raise SupervisionError("STATUS_FILE_REPLACED", "io")
+        # A filesystem may reuse an unlinked inode immediately. Also verify the
+        # last committed document so reuse or in-place edits cannot impersonate
+        # this publisher's previous snapshot. Reads remain bounded/no-follow.
+        current = _read_regular_json(self.path, self.limit, "STATUS")
+        if self._encode(current) != self._last_document_bytes:
+            raise SupervisionError("STATUS_FILE_REPLACED", "io")
         try:
             fd, temporary = tempfile.mkstemp(
                 prefix="." + self.path.name + ".tmp-", dir=self.path.parent)
@@ -510,6 +518,7 @@ class StatusPublisher:
                 raise SupervisionError("STATUS_FILE_REPLACED", "io")
             self._device = info.st_dev
             self._inode = info.st_ino
+            self._last_document_bytes = data
         except SupervisionError:
             raise
         except OSError:

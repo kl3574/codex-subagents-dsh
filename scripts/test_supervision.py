@@ -103,6 +103,16 @@ class StatusDocumentTests(unittest.TestCase):
                                     "^STATUS_FILE_REPLACED$"):
             publisher.publish(self.status_document())
 
+    def test_publisher_rejects_changed_content_even_with_the_same_inode(self):
+        _, publisher = self.publish()
+        inode = self.status_path.stat().st_ino
+        self.status_path.write_text("{}", encoding="utf-8")
+        self.assertEqual(self.status_path.stat().st_ino, inode)
+        with self.assertRaisesRegex(supervision.SupervisionError,
+                                    "^STATUS_FILE_REPLACED$"):
+            publisher.publish(self.status_document())
+        self.assertEqual(self.status_path.read_text(encoding="utf-8"), "{}")
+
     def test_terminal_completed_is_not_a_failure(self):
         _, publisher = self.publish()
         publisher.publish(self.status_document(
