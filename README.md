@@ -5,7 +5,7 @@ headless process through an ordinary Codex subagent launcher. The main agent own
 the task boundary and independently verifies the result; the launcher only starts
 the process and returns structured evidence.
 
-Version: **v0.1.0**. Ordinary runs have no default total deadline. Quiet periods
+Version: **v0.1.1**. Ordinary runs have no default total deadline. Quiet periods
 produce observations; explicit budgets, cancellation and confirmed execution errors
 have separate outcomes.
 
@@ -49,7 +49,7 @@ steps, so review and run them yourself. Replace the repository URL with the cano
 release URL if you use a fork or mirror.
 
 ```bash
-git clone --branch v0.1.0 --depth 1 https://github.com/kl3574/codex-subagents-dsh.git
+git clone --branch v0.1.1 --depth 1 https://github.com/kl3574/codex-subagents-dsh.git
 cd codex-subagents-dsh
 python3 scripts/install.py --migrate-progress
 ```
@@ -80,7 +80,7 @@ Updating an existing installation is transactional:
 
 ```bash
 git -C codex-subagents-dsh fetch --tags
-git -C codex-subagents-dsh checkout v0.1.0
+git -C codex-subagents-dsh checkout v0.1.1
 python3 codex-subagents-dsh/scripts/install.py --migrate-progress
 ```
 
@@ -98,12 +98,40 @@ python3 scripts/install.py --enable-global-routing
 
 This updates the managed block in `~/.codex/AGENTS.md` and the
 `description`/`developer_instructions` of `~/.codex/agents/{default,explorer,worker}.toml`.
-It backs up every changed file, preserves unknown keys and native `model` /
-`model_reasoning_effort` / `service_tier` settings, and leaves unrecognized custom
-launchers untouched with a warning. A legacy whole-file AGENTS.md with the old title is
+Managed launchers have their root-level `model`, `model_reasoning_effort`, and
+`service_tier` pins removed, including pins preserved by v0.1.0. The native launcher
+uses Codex's resolved defaults: explicit spawn settings, then `[agents]` defaults,
+then the parent session. The actual task model remains in the Harness profile,
+defaulting to `deepseek-official / deepseek-flash / max`.
+
+A stale native model can be rejected by the signed-in account before the launcher
+has a chance to start Harness. Inheriting the launcher settings avoids that stale
+per-role dependency; it does not check account model availability or change global
+`[agents]` defaults. See the official [Codex subagent configuration](https://learn.chatgpt.com/docs/agent-configuration/subagents).
+
+Every changed file is backed up, and unrelated keys and nested tables are preserved.
+Unrecognized custom launchers remain untouched and produce a `PARTIAL` report with
+an explicit migration command. To replace their routing instructions and remove
+their native model pins after reviewing the existing roles, use:
+
+```bash
+python3 scripts/install.py --enable-global-routing --adopt-existing-launchers
+```
+
+This adopts only `default`, `explorer`, and `worker`; their original files are
+backed up before replacement. The adoption flag requires `--enable-global-routing`.
+It does not relax the checks on unsafe paths or change the main model, credentials,
+permissions, or proxy settings. Re-running the installer is idempotent.
+
+A legacy whole-file AGENTS.md with the old title is
 migrated only when its old section is fully recognized; unknown instructions abort without
 changing the file. Without this flag, the installer does not read or write global Codex
 routing files.
+
+If a native launcher still reports an unsupported model, check explicit spawn
+overrides, global `[agents]` defaults, and project-scoped agent files. That startup
+failure is distinct from Harness authentication or a DeepSeek model-request failure;
+do not automatically replay the task as a workaround.
 
 ## What the installer writes
 

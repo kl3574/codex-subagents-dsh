@@ -9,6 +9,9 @@ defines the task, permissions, cwd, acceptance criteria, and independently verif
   `deepseek-official / deepseek-flash / max`, and `default_patches=[]`; use the
   actual bridge values when they differ. Change execution mode, profile or patches
   for a task only when the user explicitly requests it.
+- Native launchers inherit Codex's resolved model settings; the Harness profile selects
+  the actual task model. If a native model is rejected before Harness starts, report
+  that startup failure separately and inspect the launcher or global defaults.
 - Use an ordinary native Codex subagent launcher. Pass the full task, absolute cwd, allowed
   operations, acceptance criteria, and optional profile, ordered patches, session, timeout,
   and the main-agent-chosen status file.

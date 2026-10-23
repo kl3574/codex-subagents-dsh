@@ -17,7 +17,10 @@ description: 把明确、限定范围的子任务通过普通 Codex subagent 交
    `default_patches=[]`。
 2. 检查当前会话真实提供的原生 subagent 工具 schema；使用普通 launcher，支持
    `fork_turns="none"` 时使用它。工具名/字段变化时按实际 schema 调整，不依赖自定义
-   角色。
+   角色。原生启动器使用 Codex 解析后的默认模型与推理设置，不固定模型名称；
+   实际任务模型由 Harness profile 选择。若启动器先报模型不受支持，先检查原生
+   角色或全局默认配置；这时尚未进入 Harness。全局安装与旧角色迁移见
+   [README](README.md)。
 3. 发送完整消息；技能位置取自已加载技能的 base directory，路径按
    `Path.home()` 动态解析：
 

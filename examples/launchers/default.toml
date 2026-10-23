@@ -1,4 +1,4 @@
-# Managed by codex-subagents-dsh installer: description and developer_instructions are updated; other settings are preserved.
+# Managed by codex-subagents-dsh installer: description and developer_instructions are updated; native launcher model settings inherit Codex defaults; other settings are preserved.
 name = "default"
 description = "General-purpose Codex launcher: delegates scoped work to DeepSeek Harness using codex-subagents-dsh."
 developer_instructions = """

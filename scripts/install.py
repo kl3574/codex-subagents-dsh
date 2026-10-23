@@ -33,7 +33,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 SKILL_NAME = "codex-subagents-dsh"
 def _default_dest() -> Path:
     return Path.home() / ".agents" / "skills" / SKILL_NAME
@@ -70,7 +70,13 @@ MAX_PATCH = """# Explicit max overlay; not referenced by default_patches.
 AGENTS_BEGIN = "<!-- codex-subagents-dsh:begin"
 AGENTS_END = "<!-- codex-subagents-dsh:end -->"
 LAUNCHER_MARKER = ("# Managed by codex-subagents-dsh installer: description and "
-                   "developer_instructions are updated; other settings are preserved.\n")
+                   "developer_instructions are updated; native launcher model settings "
+                   "inherit Codex defaults; other settings are preserved.\n")
+# Same prefix as every pre-v0.1.1 marker; split at the first semicolon so the
+# compatibility check does not depend on the old trailing sentence.
+LAUNCHER_MARKER_PREFIX = LAUNCHER_MARKER.split(";")[0]
+LAUNCHER_MODEL_KEYS = ("model", "model_reasoning_effort", "service_tier")
+NATIVE_LAUNCHER_POLICY = "inherit_codex_defaults"
 LEGACY_AGENTS_TITLE = "# 默认子任务委派：DeepSeek Harness"
 LEGACY_AGENTS_FOOTER = "这是通过已安装技能实现的默认路由"
 # Exact known pre-release block, after substituting the two installation paths
@@ -908,6 +914,8 @@ class GlobalResult:
     plans: list[GlobalPlan] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     applied: list[str] = field(default_factory=list)
+    adopted_launchers: list[str] = field(default_factory=list)
+    migrated_launchers: list[str] = field(default_factory=list)
 
 
 def _template(root: Path, relative: str) -> str:
@@ -927,65 +935,463 @@ def _render(text: str, dest: Path, config_home: Path) -> str:
                 .replace("{{CONFIG_HOME}}", str(config_home)))
 
 
-def _find_toml_value(text: str, key: str) -> tuple[int, int] | None:
-    pattern = re.compile(rf"(?m)^{re.escape(key)}[ \t]*=")
-    matches = list(pattern.finditer(text))
-    if len(matches) != 1:
-        return None
-    start = matches[0].start()
-    index = matches[0].end()
-    while index < len(text) and text[index] in " \t":
+class _TomlScanError(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class _TomlField:
+    key: tuple[str, ...]
+    line_start: int
+    key_start: int
+    value_start: int
+    value_end: int
+    line_end: int
+
+
+_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
+_HSPACE = " \t"
+
+
+def _skip_hspace(text: str, index: int) -> int:
+    while index < len(text) and text[index] in _HSPACE:
         index += 1
-    if text.startswith('"""', index):
-        end = text.find('"""', index + 3)
-        if end < 0:
-            return None
-        end += 3
-    elif text.startswith("'''", index):
-        end = text.find("'''", index + 3)
-        if end < 0:
-            return None
-        end += 3
-    elif index < len(text) and text[index] == '"':
-        cursor = index + 1
-        escaped = False
-        while cursor < len(text):
-            char = text[cursor]
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                cursor += 1
-                break
-            cursor += 1
+    return index
+
+
+def _consume_newline(text: str, index: int) -> int:
+    if index < len(text) and text[index] == "\r":
+        index += 1
+        if index < len(text) and text[index] == "\n":
+            index += 1
+        return index
+    if index < len(text) and text[index] == "\n":
+        return index + 1
+    return index
+
+
+def _finish_toml_line(text: str, index: int) -> int:
+    """Consume optional whitespace/comment, then require a newline or EOF."""
+    index = _skip_hspace(text, index)
+    if index < len(text) and text[index] == "#":
+        while index < len(text) and text[index] not in "\r\n":
+            index += 1
+    if index >= len(text):
+        return index
+    if text[index] in "\r\n":
+        return _consume_newline(text, index)
+    raise _TomlScanError("unexpected content after a TOML value")
+
+
+def _scan_basic_string(text: str, index: int) -> int:
+    index += 1
+    while index < len(text):
+        char = text[index]
+        if char == "\\":
+            if index + 1 >= len(text) or text[index + 1] in "\r\n":
+                raise _TomlScanError("unterminated escape in a basic string")
+            index += 2
+        elif char == '"':
+            return index + 1
+        elif char in "\r\n":
+            raise _TomlScanError("newline in a single-line basic string")
         else:
-            return None
-        end = cursor
-    else:
-        end = text.find("\n", index)
-        if end < 0:
-            end = len(text)
-    return start, end
+            index += 1
+    raise _TomlScanError("unterminated basic string")
 
 
-def _replace_toml_value(text: str, key: str, block: str) -> str:
-    found = _find_toml_value(text, key)
-    if found is None:
-        return text.rstrip("\n") + "\n\n" + block + "\n"
-    start, end = found
-    return text[:start] + block + text[end:]
+def _scan_literal_string(text: str, index: int) -> int:
+    index += 1
+    while index < len(text):
+        char = text[index]
+        if char == "'":
+            return index + 1
+        if char in "\r\n":
+            raise _TomlScanError("newline in a single-line literal string")
+        index += 1
+    raise _TomlScanError("unterminated literal string")
+
+
+def _scan_multiline_string(text: str, index: int, quote: str) -> int:
+    index += 3
+    while index < len(text):
+        if quote == '"' and text[index] == "\\":
+            if index + 1 >= len(text):
+                raise _TomlScanError("unterminated escape in a multiline string")
+            index += 2
+            continue
+        if text[index] != quote:
+            index += 1
+            continue
+        end = index
+        while end < len(text) and text[end] == quote:
+            end += 1
+        count = end - index
+        if count >= 3:
+            if count > 5:
+                raise _TomlScanError("ambiguous quote run in a multiline string")
+            return end
+        index = end
+    raise _TomlScanError("unterminated multiline string")
+
+
+def _scan_quoted_string(text: str, index: int) -> int:
+    if text.startswith('"""', index):
+        return _scan_multiline_string(text, index, '"')
+    if text.startswith("'''", index):
+        return _scan_multiline_string(text, index, "'")
+    if text[index] == '"':
+        return _scan_basic_string(text, index)
+    return _scan_literal_string(text, index)
+
+
+def _scan_nested_value(text: str, index: int) -> int:
+    stack = [text[index]]
+    index += 1
+    while index < len(text):
+        char = text[index]
+        if char in "\"'":
+            index = _scan_quoted_string(text, index)
+        elif char == "#":
+            while index < len(text) and text[index] not in "\r\n":
+                index += 1
+        elif char in "[{":
+            stack.append(char)
+            index += 1
+        elif char in "]}":
+            expected = "[" if char == "]" else "{"
+            if stack[-1] != expected:
+                raise _TomlScanError("mismatched brackets in a TOML value")
+            stack.pop()
+            index += 1
+            if not stack:
+                return index
+        elif char in "\r\n":
+            index += 1
+        else:
+            index += 1
+    raise _TomlScanError("unterminated array or inline table")
+
+
+def _scan_bare_value(text: str, index: int) -> tuple[int, int]:
+    start = index
+    while index < len(text) and text[index] not in "\r\n#":
+        char = text[index]
+        if char in "\"'[]{},=":
+            raise _TomlScanError("ambiguous bare TOML value")
+        index += 1
+    end = index
+    while end > start and text[end - 1] in _HSPACE:
+        end -= 1
+    if end == start:
+        raise _TomlScanError("missing TOML value")
+    return end, _finish_toml_line(text, end)
+
+
+def _scan_toml_value(text: str, index: int) -> tuple[int, int]:
+    char = text[index]
+    if char in "\"'":
+        end = _scan_quoted_string(text, index)
+        return end, _finish_toml_line(text, end)
+    if char in "[{":
+        end = _scan_nested_value(text, index)
+        return end, _finish_toml_line(text, end)
+    return _scan_bare_value(text, index)
+
+
+def _decode_basic_key(raw: str) -> str:
+    escapes = {"b": "\b", "t": "\t", "n": "\n", "f": "\f",
+               "r": "\r", '"': '"', "\\": "\\"}
+    result: list[str] = []
+    index = 0
+    while index < len(raw):
+        char = raw[index]
+        if char != "\\":
+            result.append(char)
+            index += 1
+            continue
+        index += 1
+        if index >= len(raw):
+            raise _TomlScanError("unterminated escape in a quoted key")
+        escape = raw[index]
+        index += 1
+        if escape in escapes:
+            result.append(escapes[escape])
+        elif escape in "uU":
+            width = 4 if escape == "u" else 8
+            digits = raw[index:index + width]
+            if len(digits) != width or not re.fullmatch(r"[0-9A-Fa-f]+", digits):
+                raise _TomlScanError("invalid unicode escape in a quoted key")
+            try:
+                result.append(chr(int(digits, 16)))
+            except ValueError:
+                raise _TomlScanError("invalid unicode escape in a quoted key") from None
+            index += width
+        else:
+            raise _TomlScanError("unsupported escape in a quoted key")
+    return "".join(result)
+
+
+def _parse_toml_key(text: str, index: int) -> tuple[tuple[str, ...], int]:
+    segments: list[str] = []
+    while True:
+        index = _skip_hspace(text, index)
+        if index >= len(text):
+            raise _TomlScanError("unterminated TOML key")
+        if text[index] == '"':
+            body = index + 1
+            end = _scan_basic_string(text, index)
+            segments.append(_decode_basic_key(text[body:end - 1]))
+            index = end
+        elif text[index] == "'":
+            body = index + 1
+            end = _scan_literal_string(text, index)
+            segments.append(text[body:end - 1])
+            index = end
+        else:
+            match = _BARE_KEY.match(text, index)
+            if match is None:
+                raise _TomlScanError("invalid TOML key")
+            segments.append(match.group(0))
+            index = match.end()
+        index = _skip_hspace(text, index)
+        if index < len(text) and text[index] == ".":
+            index += 1
+            continue
+        return tuple(segments), index
+
+
+def _scan_table_header(text: str, index: int) -> int:
+    array = text.startswith("[[", index)
+    key_start = index + (2 if array else 1)
+    _, after_key = _parse_toml_key(text, key_start)
+    after_key = _skip_hspace(text, after_key)
+    closing = "]]" if array else "]"
+    if not text.startswith(closing, after_key):
+        raise _TomlScanError("unterminated TOML table header")
+    return _finish_toml_line(text, after_key + len(closing))
+
+
+def _scan_root_fields(text: str) -> tuple[list[_TomlField], int, list[tuple[int, int]]]:
+    """Return root fields, the first table header, and top-level comment spans.
+
+    The whole document is lexed for structure, but only fields in the root
+    table are returned. Keys below any table header are validated and then
+    intentionally left untouched. Strings and comments are lexed, so text such
+    as ``model = ...`` inside a multiline string is never a field.
+    """
+    fields: list[_TomlField] = []
+    comments: list[tuple[int, int]] = []
+    index = 0
+    table_start = len(text)
+    in_root = True
+    while index < len(text):
+        line_start = index
+        key_start = _skip_hspace(text, index)
+        if key_start >= len(text):
+            break
+        if text[key_start] in "\r\n":
+            index = _consume_newline(text, key_start)
+            continue
+        if text[key_start] == "#":
+            line_end = key_start
+            while line_end < len(text) and text[line_end] not in "\r\n":
+                line_end += 1
+            line_end = _consume_newline(text, line_end)
+            comments.append((line_start, line_end))
+            index = line_end
+            continue
+        if text[key_start] == "[":
+            line_end = _scan_table_header(text, key_start)
+            if in_root:
+                table_start = line_start
+                in_root = False
+            index = line_end
+            continue
+        key, after_key = _parse_toml_key(text, key_start)
+        after_key = _skip_hspace(text, after_key)
+        if after_key >= len(text) or text[after_key] != "=":
+            raise _TomlScanError("expected '=' after a TOML key")
+        value_start = _skip_hspace(text, after_key + 1)
+        if value_start >= len(text) or text[value_start] in "\r\n#":
+            raise _TomlScanError("missing TOML value")
+        value_end, line_end = _scan_toml_value(text, value_start)
+        if in_root:
+            fields.append(_TomlField(key=key, line_start=line_start,
+                                     key_start=key_start, value_start=value_start,
+                                     value_end=value_end, line_end=line_end))
+        index = line_end
+    return fields, table_start, comments
+
+
+def _root_field(fields: Iterable[_TomlField], key: str) -> _TomlField | None:
+    matches = [field for field in fields if field.key == (key,)]
+    if len(matches) > 1:
+        raise _TomlScanError(f"duplicate root TOML key {key!r}")
+    return matches[0] if matches else None
+
+
+def _remove_root_fields(text: str, keys: Iterable[str]) -> tuple[str, set[str]]:
+    fields, _, _ = _scan_root_fields(text)
+    removals: list[tuple[int, int, str]] = []
+    removed: set[str] = set()
+    for key in keys:
+        field = _root_field(fields, key)
+        if field is not None:
+            removals.append((field.line_start, field.line_end, key))
+    removals.sort(reverse=True)
+    result = text
+    for start, end, key in removals:
+        result = result[:start] + result[end:]
+        removed.add(key)
+    return result, removed
+
+
+def _insert_root_fields(text: str, root_end: int, assignments: list[str]) -> str:
+    if not assignments:
+        return text
+    prefix = text[:root_end]
+    suffix = text[root_end:]
+    insertion = ""
+    if prefix and not prefix.endswith("\n"):
+        insertion += "\n"
+    if prefix.strip() and not prefix.endswith("\n\n"):
+        insertion += "\n"
+    insertion += "\n".join(assignments) + "\n"
+    if suffix and not insertion.endswith("\n\n"):
+        insertion += "\n"
+    return prefix + insertion + suffix
+
+
+def _update_managed_fields(text: str, template: str) -> str:
+    template_fields, _, _ = _scan_root_fields(template)
+    assignments: dict[str, str] = {}
+    for key in ("description", "developer_instructions"):
+        field = _root_field(template_fields, key)
+        if field is None:
+            raise _TomlScanError(f"launcher template is missing {key}")
+        assignments[key] = template[field.key_start:field.value_end]
+
+    fields, root_end, _ = _scan_root_fields(text)
+    missing: list[str] = []
+    for key in ("description", "developer_instructions"):
+        field = _root_field(fields, key)
+        if field is None:
+            if any(existing.key[0] == key for existing in fields):
+                raise _TomlScanError(f"conflicting dotted TOML key for {key!r}")
+            missing.append(assignments[key])
+        elif any(existing.key != (key,) and existing.key[0] == key for existing in fields):
+            raise _TomlScanError(f"conflicting dotted TOML key for {key!r}")
+    if missing:
+        text = _insert_root_fields(text, root_end, missing)
+        fields, _, _ = _scan_root_fields(text)
+
+    edits: list[tuple[int, int, str]] = []
+    for key in ("description", "developer_instructions"):
+        field = _root_field(fields, key)
+        if field is None:
+            raise _TomlScanError(f"failed to insert {key}")
+        edits.append((field.key_start, field.value_end, assignments[key]))
+    edits.sort(reverse=True)
+    for start, end, assignment in edits:
+        text = text[:start] + assignment + text[end:]
+    return text
+
+
+def _ensure_launcher_marker(text: str) -> str:
+    _, table_start, comments = _scan_root_fields(text)
+    marker_lines = [
+        (start, end) for start, end in comments
+        if start < table_start and text[start:end].strip().startswith(LAUNCHER_MARKER_PREFIX)
+    ]
+    if marker_lines:
+        remaining = text
+        for start, end in sorted(marker_lines, reverse=True):
+            remaining = remaining[:start] + remaining[end:]
+        return LAUNCHER_MARKER + remaining
+    return LAUNCHER_MARKER + text
 
 
 def _launcher_recognized(text: str) -> bool:
-    return (LAUNCHER_MARKER.split(";")[0] in text or
-            any(signature in text for signature in LEGACY_LAUNCHER_SIGNATURES))
+    try:
+        fields, table_start, comments = _scan_root_fields(text)
+        instructions = _root_field(fields, "developer_instructions")
+    except _TomlScanError:
+        return text.lstrip().startswith(LAUNCHER_MARKER_PREFIX)
+    if any(start < table_start and
+           text[start:end].strip().startswith(LAUNCHER_MARKER_PREFIX)
+           for start, end in comments):
+        return True
+    if instructions is None:
+        return False
+    raw = text[instructions.value_start:instructions.value_end]
+    if raw.startswith(('"""', "'''")):
+        body = raw[3:-3]
+    elif raw.startswith(('"', "'")):
+        body = raw[1:-1]
+    else:
+        return False
+    return any(body.lstrip().startswith(signature)
+               for signature in LEGACY_LAUNCHER_SIGNATURES)
 
 
-def _prepare_global(root: Path, dest: Path, config_home: Path) -> GlobalResult:
+def _assert_launcher_identity(text: str, role: str) -> None:
+    fields, _, _ = _scan_root_fields(text)
+    field = _root_field(fields, "name")
+    if field is None:
+        raise _TomlScanError("missing root launcher name")
+    raw = text[field.value_start:field.value_end]
+    if raw.startswith('"') and not raw.startswith('"""'):
+        name = _decode_basic_key(raw[1:-1])
+    elif raw.startswith("'") and not raw.startswith("'''"):
+        name = raw[1:-1]
+    else:
+        raise _TomlScanError("launcher name must be a single-line string")
+    if name != role:
+        raise _TomlScanError("root launcher name does not match its role filename")
+    if any(len(item.key) > 1 and item.key[0] in LAUNCHER_MODEL_KEYS
+           for item in fields):
+        raise _TomlScanError("native launcher settings cannot be dotted keys")
+
+
+def _managed_launcher_text(existing: str, template: str, role: str) -> tuple[str, set[str]]:
+    try:
+        template_fields, _, _ = _scan_root_fields(template)
+        for key in ("description", "developer_instructions"):
+            if _root_field(template_fields, key) is None:
+                raise _TomlScanError(f"launcher template is missing {key}")
+    except _TomlScanError as error:
+        raise InstallError("TEMPLATE_INVALID",
+                           f"The {role} launcher template is not safe TOML: {error}.", 5) from None
+    try:
+        _assert_launcher_identity(existing, role)
+        updated, removed = _remove_root_fields(existing, LAUNCHER_MODEL_KEYS)
+        updated = _update_managed_fields(updated, template)
+        updated = _ensure_launcher_marker(updated)
+    except _TomlScanError as error:
+        raise InstallError(
+            "LAUNCHER_TOML_UNSAFE",
+            f"Cannot safely update the {role} launcher ({error}); no files were changed.", 4) from None
+    return updated, removed
+
+
+def _new_launcher_text(template: str, role: str) -> str:
+    try:
+        _assert_launcher_identity(template, role)
+        text, _ = _remove_root_fields(template, LAUNCHER_MODEL_KEYS)
+        return _ensure_launcher_marker(text)
+    except _TomlScanError as error:
+        raise InstallError("TEMPLATE_INVALID",
+                           f"The {role} launcher template is not safe TOML: {error}.", 5) from None
+
+
+def _prepare_global(root: Path, dest: Path, config_home: Path,
+                    adopt_existing: bool = False) -> GlobalResult:
     codex_home = Path.home() / ".codex"
     plans: list[GlobalPlan] = []
     warnings: list[str] = []
+    adopted: list[str] = []
+    migrated: list[str] = []
     agents_path = codex_home / "AGENTS.md"
     block = _render(_template(root, "examples/global-agents.block.md"), dest, config_home).rstrip("\n") + "\n"
     old_agents: bytes | None = None
@@ -1022,34 +1428,26 @@ def _prepare_global(root: Path, dest: Path, config_home: Path) -> GlobalResult:
                 warnings.append(f"Skipped non-UTF-8 launcher {path.name}.")
                 continue
             if not _launcher_recognized(existing):
-                warnings.append(f"Preserved unrecognized launcher {path.name}; update it manually.")
-                continue
-            description = _template_value(template, "description")
-            instructions = _template_value(template, "developer_instructions")
-            if description is None or instructions is None:
-                raise InstallError("TEMPLATE_INVALID", "A launcher template is missing managed fields.", 5)
-            updated = _replace_toml_value(existing, "description", description)
-            updated = _replace_toml_value(updated, "developer_instructions", instructions)
-            if LAUNCHER_MARKER.split(";")[0] not in updated:
-                updated = LAUNCHER_MARKER + updated
+                if not adopt_existing:
+                    warnings.append(
+                        f"Preserved unrecognized launcher {path.name}; review it, then re-run "
+                        "with --enable-global-routing --adopt-existing-launchers to adopt this role explicitly.")
+                    continue
+                adopted.append(role)
+            updated, removed = _managed_launcher_text(existing, template, role)
+            if removed:
+                migrated.append(role)
             new = updated
         else:
-            new = template
+            new = _new_launcher_text(template, role)
         encoded = new.encode("utf-8")
         if old != encoded:
             plans.append(GlobalPlan(path, old, encoded,
                                     stat.S_IMODE(path.stat().st_mode) if old is not None else 0o644,
                                     f"global/launchers/{role}.toml"))
     status = "PARTIAL" if warnings else "PASS"
-    return GlobalResult(status=status, plans=plans, warnings=warnings)
-
-
-def _template_value(template: str, key: str) -> str | None:
-    found = _find_toml_value(template, key)
-    if found is None:
-        return None
-    start, end = found
-    return template[start:end]
+    return GlobalResult(status=status, plans=plans, warnings=warnings,
+                        adopted_launchers=adopted, migrated_launchers=migrated)
 
 
 def _merge_agents(existing: str, block: str) -> str:
@@ -1118,6 +1516,18 @@ def _rollback_failure() -> InstallError:
 def _apply_global(result: GlobalResult, backups: BackupSession) -> list[tuple[Path, bytes | None, int | None]]:
     undo: list[tuple[Path, bytes | None, int | None]] = []
     try:
+        # Reject stale plans before applying their global writes.
+        for plan in result.plans:
+            try:
+                if plan.path.exists() or plan.path.is_symlink():
+                    current = plan.path.read_bytes() if _is_regular(plan.path) else object()
+                else:
+                    current = None
+            except OSError:
+                current = object()
+            if current != plan.old:
+                raise InstallError("GLOBAL_FILE_CHANGED",
+                                   "Global configuration changed after planning; re-run after reviewing it.", 4)
         for plan in result.plans:
             if plan.old is not None:
                 backups.backup_file(plan.path, plan.label)
@@ -1232,6 +1642,9 @@ def _receipt_payload(dest: Path, config_home: Path, source: dict[str, bytes],
             "status": global_result.status if global_result is not None else "DISABLED",
             "warnings": global_result.warnings if global_result is not None else [],
             "applied": global_result.applied if global_result is not None else [],
+            "native_launcher_policy": NATIVE_LAUNCHER_POLICY if global_result is not None else None,
+            "adopted_launchers": global_result.adopted_launchers if global_result is not None else [],
+            "migrated_launchers": global_result.migrated_launchers if global_result is not None else [],
         },
         "profiles": {"initialized": initialized, "preserved": preserved},
         "files_removed": removed,
@@ -1250,11 +1663,17 @@ def _report_base(dest: Path, config_home: Path, bridge_path: Path) -> dict[str, 
         "error": None,
         "warnings": [],
         "backups": [],
-        "global_routing": {"status": "DISABLED", "warnings": [], "applied": []},
+        "global_routing": {"status": "DISABLED", "warnings": [], "applied": [],
+                           "native_launcher_policy": None,
+                           "adopted_launchers": [], "migrated_launchers": []},
     }
 
 
 def install(arguments: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    if getattr(arguments, "adopt_existing_launchers", False) and not arguments.enable_global_routing:
+        raise InstallError(
+            "ADOPT_REQUIRES_GLOBAL_ROUTING",
+            "--adopt-existing-launchers requires --enable-global-routing; no files were changed.", 2)
     if os.name != "posix":
         raise InstallError("PLATFORM_NOT_SUPPORTED",
                            "This installer supports Linux/POSIX only; the Windows runtime is not verified.", 2)
@@ -1337,7 +1756,8 @@ def install(arguments: argparse.Namespace) -> tuple[dict[str, Any], int]:
     config_plan = _prepare_config(config_home, bridge)
     global_result = None
     if arguments.enable_global_routing:
-        global_result = _prepare_global(source_root, dest, config_home)
+        global_result = _prepare_global(source_root, dest, config_home,
+                                        arguments.adopt_existing_launchers)
     skill = SkillReplacement(dest, source, modes, previous_managed, arguments.update)
     has_skill_changes = skill.prepare()
     backups = BackupSession(config_home)
@@ -1389,6 +1809,9 @@ def install(arguments: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "status": global_result.status if global_result is not None else "DISABLED",
             "warnings": global_result.warnings if global_result is not None else [],
             "applied": global_result.applied if global_result is not None else [],
+            "native_launcher_policy": NATIVE_LAUNCHER_POLICY if global_result is not None else None,
+            "adopted_launchers": global_result.adopted_launchers if global_result is not None else [],
+            "migrated_launchers": global_result.migrated_launchers if global_result is not None else [],
         },
     })
     if global_result is not None:
@@ -1425,6 +1848,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="explicitly migrate bridge schema 1 to schema 2")
     parser.add_argument("--enable-global-routing", action="store_true",
                         help="update the managed global AGENTS.md block and three launcher files")
+    parser.add_argument("--adopt-existing-launchers", action="store_true",
+                        help="with --enable-global-routing, explicitly adopt existing default/explorer/worker launchers")
     parser.add_argument("--json", action="store_true", help="print one machine-readable summary")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     return parser

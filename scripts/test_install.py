@@ -20,6 +20,11 @@ import tempfile
 import textwrap
 import unittest
 
+try:
+    import tomllib
+except ImportError:  # Python 3.10 has no tomllib; raw assertions remain below.
+    tomllib = None
+
 REPO = Path(__file__).resolve().parent.parent
 INSTALLER = Path(__file__).with_name("install.py")
 FAKE_NODE = r'''#!/usr/bin/env python3
@@ -93,6 +98,15 @@ export DSH_HOME="/tmp/codex-dsh-desktop-shim-must-be-skipped"
 exit 99
 '''
 
+NEW_LAUNCHER_MARKER = (
+    "# Managed by codex-subagents-dsh installer: description and "
+    "developer_instructions are updated; native launcher model settings "
+    "inherit Codex defaults; other settings are preserved.")
+OLD_LAUNCHER_MARKER = (
+    "# Managed by codex-subagents-dsh installer: description and "
+    "developer_instructions are updated; other settings are preserved.")
+ROOT_MODEL_KEYS = ("model", "model_reasoning_effort", "service_tier")
+
 LEGACY_AGENTS = """# 默认子任务委派：DeepSeek Harness
 
 这是用户的全局 Codex 委派偏好。所有需要委派的任务，无论探索、分析、规划、实现、调试、测试、审查、研究或文档，默认使用 `codex-subagents-dsh`。主 agent 负责协调和最终独立验收；简单工作仍可由主 agent 直接完成。
@@ -117,7 +131,9 @@ class InstallerTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="codex-dsh-installer-tests-")
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        # macOS may expose the temp dir through /var while the installer sees
+        # the canonical /private/var path; keep every fixture under one spelling.
+        self.root = Path(self.temporary.name).resolve()
         self.home = self.root / "home"
         self.home.mkdir()
         self.bin = self.root / "bin"
@@ -197,6 +213,31 @@ class InstallerTests(unittest.TestCase):
 
     def assert_mode(self, path: Path, mode: int) -> None:
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), mode)
+
+    def launcher_dir(self) -> Path:
+        path = self.home / ".codex" / "agents"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def write_launcher(self, role: str, text: str) -> Path:
+        path = self.launcher_dir() / f"{role}.toml"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def assert_no_native_pins(self, text: str, label: str) -> dict | None:
+        """Use an independent parser where available; keep byte checks on 3.10."""
+        if tomllib is None:
+            # Whole-file searches reject legitimate nested fields and examples.
+            # Python 3.12 CI checks parsed root semantics; fixture byte, backup,
+            # and idempotence assertions still run on Python 3.10.
+            return None
+        try:
+            data = tomllib.loads(text)
+        except Exception as error:  # noqa: BLE001 - test diagnostic
+            self.fail(f"{label} is not valid TOML: {error}\n{text}")
+        for key in ROOT_MODEL_KEYS:
+            self.assertNotIn(key, data, label)
+        return data
 
     # ------------------------------------------------------------------ fresh
     def test_fresh_install_schema2_profiles_and_receipt(self):
@@ -371,14 +412,13 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(self.bridge()["hard_timeout_seconds"], 120)
 
     # ----------------------------------------------------------- global routes
-    def test_global_routing_is_opt_in_and_preserves_native_launcher_models(self):
+    def test_global_routing_managed_launchers_inherit_native_defaults_and_are_idempotent(self):
         codex = self.home / ".codex"
         agents = codex / "AGENTS.md"
         agents.parent.mkdir(parents=True)
         agents.write_text("# My own global rules\n\nKeep this line.\n", encoding="utf-8")
-        launchers = codex / "agents"
-        launchers.mkdir()
-        old_explorer = textwrap.dedent('''\
+        launchers = self.launcher_dir()
+        old_explorer = OLD_LAUNCHER_MARKER + "\n" + textwrap.dedent('''\
             name = "explorer"
             description = "old explorer"
             developer_instructions = """
@@ -386,34 +426,85 @@ class InstallerTests(unittest.TestCase):
             """
             model = "native-model"
             model_reasoning_effort = "xhigh"
+            service_tier = "priority"
             unknown_key = "keep"
+            permissions = { read = true, write = false }
+
+            [nested]
+            model = "nested-model"
+            service_tier = "nested-tier"
             ''')
-        (launchers / "explorer.toml").write_text(old_explorer, encoding="utf-8")
-        before = agents.read_bytes()
+        old_worker = OLD_LAUNCHER_MARKER + "\n" + textwrap.dedent('''\
+            name = "worker"
+            description = "old worker"
+            developer_instructions = "old worker instructions"
+            model = "native-worker"
+            model_reasoning_effort = "high"
+            service_tier = "flex"
+            worker_only = "keep-worker"
+            ''')
+        explorer_path = launchers / "explorer.toml"
+        worker_path = launchers / "worker.toml"
+        default_path = launchers / "default.toml"
+        explorer_path.write_text(old_explorer, encoding="utf-8")
+        explorer_path.chmod(0o640)
+        worker_path.write_text(old_worker, encoding="utf-8")
+        agents_before = agents.read_bytes()
+
         self.run_install(*self.command_args(), expected=0)
-        self.assertEqual(agents.read_bytes(), before)
-        self.assertEqual((launchers / "explorer.toml").read_text(encoding="utf-8"), old_explorer)
+        self.assertEqual(agents.read_bytes(), agents_before)
+        self.assertEqual(explorer_path.read_text(encoding="utf-8"), old_explorer)
+        self.assertEqual(worker_path.read_text(encoding="utf-8"), old_worker)
+
         _, report = self.run_install("--enable-global-routing", *self.command_args(), expected=0)
         self.assertEqual(report["global_routing"]["status"], "PASS")
+        self.assertEqual(report["global_routing"]["native_launcher_policy"],
+                         "inherit_codex_defaults")
+        self.assertEqual(report["global_routing"]["adopted_launchers"], [])
+        self.assertEqual(report["global_routing"]["migrated_launchers"], ["explorer", "worker"])
         migrated = agents.read_text(encoding="utf-8")
         self.assertIn("Keep this line.", migrated)
         self.assertIn("<!-- codex-subagents-dsh:begin", migrated)
         self.assertIn("<!-- codex-subagents-dsh:end -->", migrated)
-        launcher = (launchers / "explorer.toml").read_text(encoding="utf-8")
-        self.assertIn('model = "native-model"', launcher)
-        self.assertIn('model_reasoning_effort = "xhigh"', launcher)
-        self.assertIn('unknown_key = "keep"', launcher)
-        self.assertIn("codex-subagents-dsh", launcher)
-        self.assertTrue((launchers / "default.toml").is_file())
-        self.assertTrue((launchers / "worker.toml").is_file())
-        self.assertTrue((Path(report["backup_root"]) / "global" / "AGENTS.md").is_file())
-        self.assertTrue((Path(report["backup_root"]) / "global" / "launchers" / "explorer.toml").is_file())
-        snapshot = agents.read_bytes()
-        snapshot_launcher = launcher
+
+        for path in (explorer_path, worker_path, default_path):
+            text = path.read_text(encoding="utf-8")
+            self.assertEqual(text.splitlines()[0], NEW_LAUNCHER_MARKER)
+            self.assertEqual(text.count(NEW_LAUNCHER_MARKER), 1)
+            self.assert_no_native_pins(text, path.name)
+        self.assert_mode(explorer_path, 0o640)
+
+        explorer_text = explorer_path.read_text(encoding="utf-8")
+        worker_text = worker_path.read_text(encoding="utf-8")
+        self.assertNotIn(OLD_LAUNCHER_MARKER, explorer_text)
+        self.assertIn("Read-only exploration launcher", explorer_text)
+        self.assertIn("Implementation launcher", worker_text)
+        self.assertIn('unknown_key = "keep"', explorer_text)
+        self.assertIn('worker_only = "keep-worker"', worker_text)
+        if tomllib is not None:
+            explorer_data = tomllib.loads(explorer_text)
+            self.assertEqual(explorer_data["permissions"], {"read": True, "write": False})
+            self.assertEqual(explorer_data["nested"], {"model": "nested-model",
+                                                       "service_tier": "nested-tier"})
+            self.assertEqual(tomllib.loads(worker_text)["worker_only"], "keep-worker")
+
+        backup = Path(report["backup_root"])
+        self.assertEqual((backup / "global" / "AGENTS.md").read_bytes(), agents_before)
+        self.assertEqual((backup / "global" / "launchers" / "explorer.toml").read_bytes(),
+                         old_explorer.encode("utf-8"))
+        receipt = json.loads((self.config / "install-receipt.json").read_text(encoding="utf-8"))
+        self.assertEqual(receipt["global_routing"]["native_launcher_policy"],
+                         "inherit_codex_defaults")
+        self.assertEqual(receipt["global_routing"]["migrated_launchers"], ["explorer", "worker"])
+
+        snapshot = {path: path.read_bytes()
+                    for path in (agents, explorer_path, worker_path, default_path)}
         _, report = self.run_install("--enable-global-routing", *self.command_args(), expected=0)
-        self.assertEqual(agents.read_bytes(), snapshot)
-        self.assertEqual((launchers / "explorer.toml").read_text(encoding="utf-8"), snapshot_launcher)
         self.assertEqual(report["global_routing"]["applied"], [])
+        self.assertEqual(report["global_routing"]["migrated_launchers"], [])
+        for path, before in snapshot.items():
+            self.assertEqual(path.read_bytes(), before)
+        self.assert_mode(explorer_path, 0o640)
 
     def test_legacy_global_agents_is_migrated_without_duplicate(self):
         codex = self.home / ".codex"
@@ -463,8 +554,389 @@ class InstallerTests(unittest.TestCase):
         (launchers / "default.toml").write_text(custom, encoding="utf-8")
         _, report = self.run_install("--enable-global-routing", *self.command_args(), expected=0)
         self.assertEqual(report["global_routing"]["status"], "PARTIAL")
-        self.assertTrue(any("default.toml" in warning for warning in report["warnings"]))
+        self.assertEqual(report["global_routing"]["adopted_launchers"], [])
+        warning_text = "\n".join(report["warnings"])
+        self.assertIn("default.toml", warning_text)
+        self.assertIn("--adopt-existing-launchers", warning_text)
         self.assertEqual((launchers / "default.toml").read_text(encoding="utf-8"), custom)
+
+    def test_adopt_existing_launchers_cleans_models_and_records_roles(self):
+        launchers = self.launcher_dir()
+        old_explorer = textwrap.dedent('''\
+            name = "explorer"
+            description = "old explorer"
+            developer_instructions = "old explorer instructions"
+            model = "native-model"
+            model_reasoning_effort = "xhigh"
+            service_tier = "priority"
+            explorer_only = "keep-explorer"
+
+            [nested]
+            model = "nested-explorer"
+            ''')
+        old_worker = textwrap.dedent('''\
+            name = "worker"
+            description = "old worker"
+            developer_instructions = "old worker instructions"
+            model = "native-worker"
+            model_reasoning_effort = "high"
+            service_tier = "flex"
+            worker_only = "keep-worker"
+            ''')
+        explorer_path = launchers / "explorer.toml"
+        worker_path = launchers / "worker.toml"
+        explorer_path.write_text(old_explorer, encoding="utf-8")
+        worker_path.write_text(old_worker, encoding="utf-8")
+
+        _, report = self.run_install("--enable-global-routing",
+                                     "--adopt-existing-launchers",
+                                     *self.command_args(), expected=0)
+        self.assertEqual(report["global_routing"]["status"], "PASS")
+        self.assertEqual(report["global_routing"]["adopted_launchers"], ["explorer", "worker"])
+        self.assertEqual(report["global_routing"]["migrated_launchers"], ["explorer", "worker"])
+        self.assertEqual(report["global_routing"]["native_launcher_policy"],
+                         "inherit_codex_defaults")
+
+        explorer_text = explorer_path.read_text(encoding="utf-8")
+        worker_text = worker_path.read_text(encoding="utf-8")
+        for text, label in ((explorer_text, "explorer.toml"), (worker_text, "worker.toml")):
+            self.assertEqual(text.splitlines()[0], NEW_LAUNCHER_MARKER)
+            self.assertEqual(text.count(NEW_LAUNCHER_MARKER), 1)
+            self.assert_no_native_pins(text, label)
+        self.assertIn("keep-explorer", explorer_text)
+        self.assertIn("keep-worker", worker_text)
+        self.assertIn("Read-only exploration launcher", explorer_text)
+        self.assertIn("Implementation launcher", worker_text)
+        if tomllib is not None:
+            self.assertEqual(tomllib.loads(explorer_text)["nested"],
+                             {"model": "nested-explorer"})
+            self.assertEqual(tomllib.loads(worker_text)["worker_only"], "keep-worker")
+
+        backup = Path(report["backup_root"])
+        self.assertEqual((backup / "global" / "launchers" / "explorer.toml").read_text(
+            encoding="utf-8"), old_explorer)
+        self.assertEqual((backup / "global" / "launchers" / "worker.toml").read_text(
+            encoding="utf-8"), old_worker)
+        receipt = json.loads((self.config / "install-receipt.json").read_text(encoding="utf-8"))
+        self.assertEqual(receipt["global_routing"]["adopted_launchers"],
+                         ["explorer", "worker"])
+        self.assertEqual(receipt["global_routing"]["migrated_launchers"],
+                         ["explorer", "worker"])
+
+        snapshot = {path: path.read_bytes() for path in (explorer_path, worker_path)}
+        _, report = self.run_install("--enable-global-routing",
+                                     "--adopt-existing-launchers",
+                                     *self.command_args(), expected=0)
+        self.assertEqual(report["global_routing"]["applied"], [])
+        for path, before in snapshot.items():
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_adopt_requires_enable_global_routing_and_writes_nothing(self):
+        custom = textwrap.dedent('''\
+            name = "explorer"
+            description = "custom"
+            developer_instructions = "custom"
+            model = "native"
+            ''')
+        explorer_path = self.write_launcher("explorer", custom)
+        before = explorer_path.read_bytes()
+        _, report = self.run_install("--adopt-existing-launchers",
+                                     *self.command_args(), expected=2)
+        self.assertEqual(report["error"]["code"], "ADOPT_REQUIRES_GLOBAL_ROUTING")
+        self.assertIn("requires --enable-global-routing", report["error"]["message"])
+        self.assertFalse(self.dest.exists())
+        self.assertFalse(self.config.exists())
+        self.assertFalse((self.home / ".codex" / "AGENTS.md").exists())
+        self.assertEqual(explorer_path.read_bytes(), before)
+
+    def test_toml_removal_preserves_nested_and_multiline_string_fields(self):
+        launcher = OLD_LAUNCHER_MARKER + "\n" + "\n".join([
+            '   "model"   =   "native"   # root pin',
+            "\t'service_tier' = \"priority\"",
+            'name = "worker"',
+            'description = "old description"',
+            'developer_instructions = "old instructions"',
+            '  keep_indent   =   "yes"   # keep this line',
+            'notes_basic = """',
+            '[not-a-real-table]',
+            'model = "keep-basic"',
+            'service_tier = "keep-basic-tier"',
+            '"""',
+            "notes_literal = '''",
+            'model = "keep-literal"',
+            'model_reasoning_effort = "keep-literal-effort"',
+            "'''",
+            'model_reasoning_effort = "xhigh" # root effort after multiline strings',
+            'custom = { keep = true }',
+            '[nested]',
+            'model = "nested-model"',
+            'model_reasoning_effort = "nested-effort"',
+            'service_tier = "nested-tier"',
+            '',
+        ])
+        path = self.write_launcher("worker", launcher)
+        self.run_install("--enable-global-routing", *self.command_args(), expected=0)
+        text = path.read_text(encoding="utf-8")
+        self.assertEqual(text.splitlines()[0], NEW_LAUNCHER_MARKER)
+        self.assertEqual(text.count(NEW_LAUNCHER_MARKER), 1)
+        self.assertNotIn("# root pin", text)
+        self.assertNotIn("# root effort", text)
+        self.assertIn('  keep_indent   =   "yes"   # keep this line', text)
+        data = self.assert_no_native_pins(text, "worker.toml")
+        if data is not None:
+            self.assertEqual(data["name"], "worker")
+            self.assertIn('[not-a-real-table]', data["notes_basic"])
+            self.assertIn('model = "keep-basic"', data["notes_basic"])
+            self.assertIn('service_tier = "keep-basic-tier"', data["notes_basic"])
+            self.assertIn('model = "keep-literal"', data["notes_literal"])
+            self.assertIn('model_reasoning_effort = "keep-literal-effort"',
+                          data["notes_literal"])
+            self.assertEqual(data["custom"], {"keep": True})
+            self.assertEqual(data["nested"], {"model": "nested-model",
+                                               "model_reasoning_effort": "nested-effort",
+                                               "service_tier": "nested-tier"})
+            self.assertNotIn("model = \"native\"", text)
+
+    def test_receipt_write_failure_restores_launcher_and_agents_bytes(self):
+        self.run_install(*self.command_args(), expected=0)
+        codex = self.home / ".codex"
+        agents = codex / "AGENTS.md"
+        agents.parent.mkdir(parents=True, exist_ok=True)
+        agents.write_text("# user global\n\nKeep this.\n", encoding="utf-8")
+        launchers = self.launcher_dir()
+        old_explorer = OLD_LAUNCHER_MARKER + "\n" + textwrap.dedent('''\
+            name = "explorer"
+            description = "old explorer"
+            developer_instructions = "old instructions"
+            model = "native"
+            model_reasoning_effort = "xhigh"
+            service_tier = "priority"
+            ''')
+        explorer_path = launchers / "explorer.toml"
+        explorer_path.write_text(old_explorer, encoding="utf-8")
+        default_path = launchers / "default.toml"
+        agents_before = agents.read_bytes()
+        explorer_before = explorer_path.read_bytes()
+        receipt_before = (self.config / "install-receipt.json").read_bytes()
+        probe = textwrap.dedent("""
+            import sys
+            sys.path.insert(0, sys.argv[1])
+            import install
+            original = install._atomic_write
+            def write(path, data, mode):
+                if path.name == "install-receipt.json":
+                    raise OSError("injected receipt failure")
+                return original(path, data, mode)
+            install._atomic_write = write
+            raise SystemExit(install.main(sys.argv[2:]))
+        """)
+        result = subprocess.run(
+            [sys.executable, "-c", probe, str(self.source / "scripts"),
+             "--dest", str(self.dest), "--config-home", str(self.config),
+             "--enable-global-routing", "--json", *self.command_args()],
+            env=self.env(), text=True, capture_output=True, timeout=90)
+        self.assertEqual(result.returncode, 5, result.stdout + result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["error"]["code"], "TRANSACTION_FAILED")
+        self.assertEqual(agents.read_bytes(), agents_before)
+        self.assertEqual(explorer_path.read_bytes(), explorer_before)
+        self.assertFalse(default_path.exists())
+        self.assertEqual((self.config / "install-receipt.json").read_bytes(), receipt_before)
+        backup_root = Path(report["backup_root"])
+        self.assertTrue(backup_root.is_dir())
+        backup_explorer = backup_root / "global" / "launchers" / "explorer.toml"
+        self.assertEqual(backup_explorer.read_bytes(), explorer_before)
+        self.assertEqual((backup_root / "global" / "AGENTS.md").read_bytes(), agents_before)
+
+    def test_adopt_does_not_relax_unsafe_symlink_or_non_utf8(self):
+        launchers = self.launcher_dir()
+        target = self.root / "symlink-target.toml"
+        target_text = 'name = "explorer"\nmodel = "native"\n'
+        target.write_text(target_text, encoding="utf-8")
+        explorer_path = launchers / "explorer.toml"
+        explorer_path.symlink_to(target)
+        worker_path = launchers / "worker.toml"
+        worker_bytes = b'name = "worker"\nmodel = "\xff"\n'
+        worker_path.write_bytes(worker_bytes)
+        default_text = ('name = "default"\ndeveloper_instructions = "custom"\n'
+                        'model = "native"\n')
+        default_path = launchers / "default.toml"
+        default_path.write_text(default_text, encoding="utf-8")
+
+        _, report = self.run_install("--enable-global-routing",
+                                     "--adopt-existing-launchers",
+                                     *self.command_args(), expected=0)
+        self.assertEqual(report["global_routing"]["status"], "PARTIAL")
+        self.assertEqual(report["global_routing"]["adopted_launchers"], ["default"])
+        self.assertEqual(report["global_routing"]["migrated_launchers"], ["default"])
+        warning_text = "\n".join(report["warnings"])
+        self.assertIn("explorer.toml", warning_text)
+        self.assertIn("worker.toml", warning_text)
+        self.assertTrue(explorer_path.is_symlink())
+        self.assertEqual(target.read_text(encoding="utf-8"), target_text)
+        self.assertEqual(worker_path.read_bytes(), worker_bytes)
+        default_result = default_path.read_text(encoding="utf-8")
+        self.assertEqual(default_result.splitlines()[0], NEW_LAUNCHER_MARKER)
+        self.assert_no_native_pins(default_result, "default.toml")
+
+    def test_unsafe_or_unparseable_launcher_toml_fails_closed(self):
+        variants = (
+            OLD_LAUNCHER_MARKER + '\nname = "worker"\nmodel = """unterminated\n',
+            OLD_LAUNCHER_MARKER + '\nname = "worker"\nnot a toml assignment\n',
+            OLD_LAUNCHER_MARKER + '\nname = "worker"\nmodel = "a"\nmodel = "b"\n',
+            OLD_LAUNCHER_MARKER + '\nname = "worker"\n[nested\nmodel = "m"\n',
+            OLD_LAUNCHER_MARKER + '\nname = "worker"\n[nested]\nnote = """unterminated\n',
+        )
+        for index, launcher in enumerate(variants):
+            with self.subTest(variant=index):
+                path = self.write_launcher("worker", launcher)
+                before = path.read_bytes()
+                _, report = self.run_install("--enable-global-routing",
+                                             *self.command_args(), expected=4)
+                self.assertEqual(report["error"]["code"], "LAUNCHER_TOML_UNSAFE")
+                self.assertEqual(path.read_bytes(), before)
+                self.assertFalse(self.dest.exists())
+                self.assertFalse(self.config.exists())
+                self.assertFalse((self.home / ".codex" / "AGENTS.md").exists())
+
+    def test_new_launcher_files_normalize_old_template_header(self):
+        source = self.copy_source("source-old-launcher-header")
+        for role in ("default", "explorer", "worker"):
+            path = source / "examples" / "launchers" / f"{role}.toml"
+            lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+            self.assertTrue(lines[0].startswith("# Managed by"))
+            lines[0] = OLD_LAUNCHER_MARKER + "\n"
+            path.write_text("".join(lines), encoding="utf-8")
+        _, report = self.run_install("--enable-global-routing", *self.command_args(),
+                                     source=source, expected=0)
+        self.assertEqual(report["global_routing"]["status"], "PASS")
+        self.assertEqual(report["global_routing"]["adopted_launchers"], [])
+        self.assertEqual(report["global_routing"]["migrated_launchers"], [])
+        launchers = self.home / ".codex" / "agents"
+        for role in ("default", "explorer", "worker"):
+            text = (launchers / f"{role}.toml").read_text(encoding="utf-8")
+            self.assertEqual(text.splitlines()[0], NEW_LAUNCHER_MARKER)
+            self.assertEqual(text.count(NEW_LAUNCHER_MARKER), 1)
+            self.assert_no_native_pins(text, f"{role}.toml")
+
+
+    def test_adopt_rejects_mismatched_role_name_without_writes(self):
+        original = ('name = "a_different_role"\ndescription = "custom"\n'
+                    'developer_instructions = "custom"\nmodel = "old"\n')
+        path = self.write_launcher("worker", original)
+        _, report = self.run_install("--enable-global-routing", "--adopt-existing-launchers",
+                                     *self.command_args(), expected=4)
+        self.assertEqual(report["error"]["code"], "LAUNCHER_TOML_UNSAFE")
+        self.assertEqual(path.read_bytes(), original.encode())
+        self.assertFalse(self.dest.exists())
+        self.assertFalse(self.config.exists())
+        self.assertFalse((self.home / ".codex/AGENTS.md").exists())
+
+    def test_marker_and_legacy_examples_do_not_adopt_custom_roles(self):
+        variants = (
+            '# 你是实现任务的 Codex 桥接执行子 agent\n',
+            'notes = "你是实现任务的 Codex 桥接执行子 agent"\n',
+            'notes = """\n' + OLD_LAUNCHER_MARKER + '\n"""\n',
+            '[nested]\ndeveloper_instructions = "你是实现任务的 Codex 桥接执行子 agent"\n',
+        )
+        for example in variants:
+            with self.subTest(example=example):
+                original = ('name = "worker"\ndescription = "custom"\n'
+                            'developer_instructions = "custom"\nmodel = "keep"\n' + example)
+                path = self.write_launcher("worker", original)
+                _, report = self.run_install("--enable-global-routing",
+                                             *self.command_args(), expected=0)
+                self.assertEqual(report["global_routing"]["status"], "PARTIAL")
+                self.assertEqual(path.read_bytes(), original.encode())
+
+    def test_legacy_signature_in_root_instructions_is_migrated(self):
+        original = ('name = "worker"\ndescription = "old"\n'
+                    'developer_instructions = """\n你是实现任务的 Codex 桥接执行子 agent。\n"""\n'
+                    'model = "unsupported-legacy"\n')
+        path = self.write_launcher("worker", original)
+        _, report = self.run_install("--enable-global-routing", *self.command_args(), expected=0)
+        self.assertEqual(report["global_routing"]["status"], "PASS")
+        self.assertNotIn('model = "unsupported-legacy"', path.read_text())
+        self.assertIn("Implementation launcher", path.read_text())
+
+    def test_crlf_unknown_sections_and_missing_final_newline_are_preserved(self):
+        suffix = ('unknown_key = "keep" # inline note\r\n\r\n'
+                  '[metadata]\r\nmodel = "nested value"')
+        original = (OLD_LAUNCHER_MARKER + '\r\nname = "worker"\r\n'
+                    'description = "old"\r\ndeveloper_instructions = "old"\r\n'
+                    'model = "obsolete" # remove pin\r\n' + suffix).encode()
+        path = self.write_launcher("worker", "")
+        path.write_bytes(original)
+        _, report = self.run_install("--enable-global-routing", *self.command_args(), expected=0)
+        actual = path.read_bytes()
+        self.assertTrue(actual.endswith(suffix.encode()))
+        self.assertNotIn(b'model = "obsolete"', actual)
+        backup = Path(report["backup_root"]) / "global/launchers/worker.toml"
+        self.assertEqual(backup.read_bytes(), original)
+        self.run_install("--enable-global-routing", *self.command_args(), expected=0)
+        self.assertEqual(path.read_bytes(), actual)
+
+    def test_global_write_failure_restores_earlier_global_files(self):
+        self.run_install(*self.command_args(), expected=0)
+        original = (OLD_LAUNCHER_MARKER + '\nname = "explorer"\n'
+                    'description = "old"\ndeveloper_instructions = "old"\nmodel = "old"\n')
+        explorer = self.write_launcher("explorer", original)
+        agents = self.home / ".codex/AGENTS.md"
+        agents.write_text("Keep user rules.\n")
+        before = agents.read_bytes()
+        probe = textwrap.dedent('''\
+            import sys
+            sys.path.insert(0, sys.argv[1])
+            import install
+            original = install._atomic_write
+            injected = False
+            def write(path, data, mode):
+                global injected
+                if not injected and path.name == "explorer.toml":
+                    injected = True
+                    raise OSError("injected global write failure")
+                return original(path, data, mode)
+            install._atomic_write = write
+            raise SystemExit(install.main(sys.argv[2:]))
+            ''')
+        result = subprocess.run(
+            [sys.executable, "-c", probe, str(self.source / "scripts"),
+             "--dest", str(self.dest), "--config-home", str(self.config),
+             "--enable-global-routing", "--json", *self.command_args()],
+            env=self.env(), text=True, capture_output=True, timeout=90)
+        self.assertEqual(result.returncode, 5, result.stdout)
+        self.assertEqual(json.loads(result.stdout)["error"]["code"], "TRANSACTION_FAILED")
+        self.assertEqual(agents.read_bytes(), before)
+        self.assertEqual(explorer.read_text(), original)
+        self.assertFalse((self.launcher_dir() / "default.toml").exists())
+
+    def test_stale_global_plan_preserves_concurrent_edit(self):
+        original = (OLD_LAUNCHER_MARKER + '\nname = "worker"\n'
+                    'description = "old"\ndeveloper_instructions = "old"\nmodel = "old"\n')
+        worker = self.write_launcher("worker", original)
+        probe = textwrap.dedent('''\
+            import sys
+            from pathlib import Path
+            sys.path.insert(0, sys.argv[1])
+            import install
+            original = install._prepare_global
+            def prepare(*args, **kwargs):
+                plan = original(*args, **kwargs)
+                (Path.home() / ".codex/agents/worker.toml").write_text("concurrent user edit\\n")
+                return plan
+            install._prepare_global = prepare
+            raise SystemExit(install.main(sys.argv[2:]))
+            ''')
+        result = subprocess.run(
+            [sys.executable, "-c", probe, str(self.source / "scripts"),
+             "--dest", str(self.dest), "--config-home", str(self.config),
+             "--enable-global-routing", "--json", *self.command_args()],
+            env=self.env(), text=True, capture_output=True, timeout=90)
+        self.assertEqual(result.returncode, 4, result.stdout)
+        self.assertEqual(json.loads(result.stdout)["error"]["code"], "GLOBAL_FILE_CHANGED")
+        self.assertEqual(worker.read_text(), "concurrent user edit\n")
+        self.assertFalse((self.home / ".codex/AGENTS.md").exists())
+        self.assertFalse((self.launcher_dir() / "default.toml").exists())
 
     # ---------------------------------------------------------------- discovery
     def test_auto_discovery_skips_dsh_home_shim_and_finds_npm_entry(self):

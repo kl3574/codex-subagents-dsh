@@ -19,6 +19,17 @@ directory；配置目录默认是 `Path.home()/.dsh-codex`。本文用 `$HOME` �
 安装、更新、迁移和可选全局路由的准确命令见仓库 [README](../README.md)。日常执行
 不需要重新运行安装器，也不要重新初始化已有 profile。
 
+启用全局路由时，v0.1.1 会从受管原生启动器移除根级 `model`、
+`model_reasoning_effort`、`service_tier`，让它使用 Codex 解析后的默认值。
+原生模型选择依次来自显式 spawn 参数、全局 `[agents]` 默认、父会话；实际
+Harness 任务仍使用上面的 DeepSeek profile。已有未受管自定义角色默认保留；
+检查原文件后，可用 `--enable-global-routing --adopt-existing-launchers` 显式
+备份并迁移 `default`、`explorer`、`worker`。重复运行保持幂等。
+
+原生启动器的模型被账户拒绝时，Harness 尚未启动。先检查原生角色、全局
+`[agents]` 默认、项目级角色或本次 spawn 覆盖；不要把该错误报成 DeepSeek API
+失败，也不要通过自动重放业务请求来处理。
+
 ## 2. bridge schema 2
 
 安装器写入的新配置形如（路径必须展开为绝对路径；下面是占位示例）：
