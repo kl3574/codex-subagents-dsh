@@ -70,12 +70,22 @@ schema 1 的 `timeout_seconds` 是旧的隐式硬预算。安装器只有在显�
 
 ## 3. profile、patch 与选择顺序
 
-默认运行：
+每次调用先创建一个新受管运行（同 session 后续调用也创建新目录）：
+
+```bash
+python3 <skill-dir>/scripts/manage_dsh.py prepare \
+  --config "$HOME/.dsh-codex/bridge.json" --cwd /absolute/workspace
+```
+
+下列示例中的 `/absolute/owned/run` 使用本次 prepare 返回的 `run_dir`。
+临时输入放入其 scratch；借用文件可继续从原路径只读传入。
+执行结束后由主 agent 验收并 finalize，命令与保留规则见
+[产物收尾](artifact-lifecycle.md)。默认运行：
 
 ```bash
 python3 <skill-dir>/scripts/run_dsh.py \
   --config "$HOME/.dsh-codex/bridge.json" \
-  --cwd /absolute/workspace --task-file /absolute/task.txt
+  --cwd /absolute/workspace --task-file /absolute/task.txt --run-dir /absolute/owned/run
 ```
 
 选择另一个已有 profile（只影响本次）：
@@ -84,7 +94,7 @@ python3 <skill-dir>/scripts/run_dsh.py \
 python3 <skill-dir>/scripts/run_dsh.py \
   --config "$HOME/.dsh-codex/bridge.json" \
   --cwd /absolute/workspace --task-file /absolute/task.txt \
-  --profile codex-dsh-review
+  --run-dir /absolute/owned/run --profile codex-dsh-review
 ```
 
 应用一个或多个按序 patch（可重复）：
@@ -93,7 +103,7 @@ python3 <skill-dir>/scripts/run_dsh.py \
 python3 <skill-dir>/scripts/run_dsh.py \
   --config "$HOME/.dsh-codex/bridge.json" \
   --cwd /absolute/workspace --task-file /absolute/task.txt \
-  --patch "$HOME/.dsh-codex/patches/max.yml"
+  --run-dir /absolute/owned/run --patch "$HOME/.dsh-codex/patches/max.yml"
 ```
 
 顺序是：所选 profile 的 bundle 层与 `cordis.patch.yml`，然后
@@ -111,13 +121,13 @@ profile，只用于首次创建或明确的官方重建，日常启动器不使�
 `--task-file -` 显式从 stdin 读取完整 UTF-8 任务。`--timeout` 接受有限正数秒，是
 本次运行的硬预算。任务通过文件或 stdin 传输，不用 shell 拼接。
 
-主 agent 可以为本次运行指定一个新的、绝对路径的 `--status-file`：
+受管调用的状态文件由 prepare 返回，并由 `--run-dir` 自动选择：
 
 ```bash
 python3 <skill-dir>/scripts/run_dsh.py \
   --config "$HOME/.dsh-codex/bridge.json" \
   --cwd /absolute/workspace --task-file /absolute/task.txt \
-  --status-file /absolute/private/run.status.json
+  --run-dir /absolute/owned/run
 ```
 
 状态文件必须尚不存在且父目录已存在；运行器创建权限 0600 的有界快照，并拒绝
@@ -125,14 +135,14 @@ python3 <skill-dir>/scripts/run_dsh.py \
 
 ```bash
 python3 <skill-dir>/scripts/manage_dsh.py status \
-  --status-file /absolute/private/run.status.json
+  --status-file /absolute/owned/run/diagnostics/status.json
 ```
 
 需要取消时，由本次 owner 写一个与 `run_id` 和目标进程身份绑定的单次请求：
 
 ```bash
 python3 <skill-dir>/scripts/manage_dsh.py cancel \
-  --status-file /absolute/private/run.status.json --reason user_cancelled
+  --status-file /absolute/owned/run/diagnostics/status.json --reason user_cancelled
 ```
 
 `manage_dsh.py` 从不直接 kill PID：它校验状态文件、supervisor/child 身份和心跳
@@ -142,7 +152,9 @@ python3 <skill-dir>/scripts/manage_dsh.py cancel \
 
 `manage_dsh.py` 退出码：0 已读取状态或已写取消请求（状态仍可能是 `UNKNOWN`）；
 2 参数/配置错误；3 状态文件缺失、损坏、不可读或不安全；4 取消被拒绝（状态非
-live/fresh）；5 控制请求无法写入或已存在。其输出是单行 JSON，`status` 子命令的
+live/fresh）；5 控制请求无法写入或已存在；6 产物清理部分失败。
+旧的未受管调用仍可指定独立 `--status-file`；受管调用若显式传入状态路径，
+必须等于 prepare 的返回值。其输出是单行 JSON，`status` 子命令的
 `state` 可能是 `RUNNING`、`COMPLETED`、`FAILED`、`CANCELLED`、`TIMED_OUT`、
 `INTERRUPTED`、`CLEANUP_FAILED` 或 `UNKNOWN`。`UNKNOWN` 只是观察不可确认，不等于
 任务失败，也不是重跑理由。
@@ -219,13 +231,13 @@ subagent 的交互式消息能力，不能把 session 恢复当作向正在运�
 ## 7. 恢复与不重跑
 
 恢复使用上次结构化输出中的真实 `session_id`，并保持相同 DSH_HOME、cwd、profile
-和有序 patches：
+和有序 patches。先 prepare 新运行，再使用它的新目录：
 
 ```bash
 python3 <skill-dir>/scripts/run_dsh.py \
   --config "$HOME/.dsh-codex/bridge.json" \
   --cwd /absolute/workspace --task-file /absolute/followup.txt \
-  --session-id session-REPLACE-WITH-RETURNED-ID
+  --run-dir /absolute/new/owned/run --session-id session-REPLACE-WITH-RETURNED-ID
 ```
 
 启动器先检查自己记录的 session 选择，再由 Harness 执行官方兼容性检查。外部已有

@@ -87,6 +87,8 @@ with patch('artifacts.time.time', return_value=float(sys.argv[1])):
         self.assertEqual(result["run_id"], run["run_id"])
         self.assertEqual(result["artifacts"]["state"], "pending_acceptance")
         self.assertEqual(result["artifacts"]["acceptance"], "pending")
+        logged = json.loads((Path(result["log_dir"]) / "result.json").read_text())
+        self.assertEqual(logged["artifacts"], result["artifacts"])
         self.assertTrue(Path(result["log_dir"]).is_relative_to(Path(run["diagnostics_dir"])))
         answer = json.loads(result["answer"])
         self.assertEqual(answer["cwd"], str(self.cwd))
@@ -394,6 +396,19 @@ with patch('os.unlink', failing), patch('artifacts.time.time', return_value=floa
         self.assertEqual(sweep["runs"][0]["reason"], "ARTIFACT_TARGET_CHANGED")
         self.assertEqual((diagnostic / "replacement").read_text(), "keep replacement")
 
+    def test_corrupt_closeout_record_is_a_structured_refusal(self):
+        run = self.prepare()
+        recovery = Path(run["scratch_dir"]) / "keep"
+        recovery.write_text("keep")
+        self.run_task(run)
+        path = Path(run["run_dir"]) / "run.json"
+        doc = json.loads(path.read_text())
+        doc["closeout"] = {}
+        path.write_text(json.dumps(doc))
+        response = self.finalize(run, expected=2)
+        self.assertEqual(response["reason"], "ARTIFACT_MANIFEST_INVALID")
+        self.assertTrue(recovery.exists())
+
     def test_prepare_allocates_private_unique_owned_storage_without_model(self):
         first, second = self.prepare(), self.prepare()
         self.assertNotEqual(first["run_id"], second["run_id"])
@@ -410,6 +425,19 @@ with patch('os.unlink', failing), patch('artifacts.time.time', return_value=floa
                 self.assertEqual(path.stat().st_mode & 0o777, 0o700)
         self.assertFalse(self.invoked.exists())
         self.assertEqual(list(self.cwd.iterdir()), [])
+
+    def test_prepare_refuses_insecure_container_without_touching_sessions(self):
+        parent = self.home / ".codex-dsh-wrapper"
+        parent.mkdir(mode=0o755)
+        sessions = parent / "sessions"
+        sessions.mkdir(mode=0o700)
+        existing = sessions / "legacy.json"
+        existing.write_text("legacy session selection")
+        result = self.manage("prepare", "--config", str(self.config), "--cwd", str(self.cwd), expected=2)
+        self.assertEqual(result["reason"], "ARTIFACT_ROOT_UNSAFE")
+        self.assertEqual(parent.stat().st_mode & 0o777, 0o755)
+        self.assertFalse((parent / "runs").exists())
+        self.assertEqual(existing.read_text(), "legacy session selection")
 
 
 if __name__ == "__main__":

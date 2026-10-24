@@ -115,7 +115,7 @@ class RunLease:
                 raise ArtifactError("ARTIFACT_RUN_BUSY") from None
             self.document = self._read()
             doc = self.document
-            if (doc.get("schema_version") != SCHEMA_VERSION
+            if (type(doc.get("schema_version")) is not int or doc["schema_version"] != SCHEMA_VERSION
                     or doc.get("run_id") != self.path.name
                     or len(self.path.name) != 32
                     or any(c not in "0123456789abcdef" for c in self.path.name)
@@ -125,6 +125,26 @@ class RunLease:
                     or doc.get("state") not in {"prepared", "running", "pending_acceptance",
                                                  "unknown", "closeout_pending", "closed"}
                     or (doc.get("closeout") is not None and not isinstance(doc["closeout"], dict))):
+                raise ArtifactError("ARTIFACT_MANIFEST_INVALID")
+            closeout = doc.get("closeout")
+            if closeout is not None:
+                cleanup = closeout.get("cleanup")
+                if (closeout.get("disposition") not in {"accepted", "abandoned"}
+                        or type(closeout.get("delivered")) is not bool
+                        or (closeout["disposition"] == "accepted" and not closeout["delivered"])
+                        or not isinstance(cleanup, dict)
+                        or cleanup.get("status") not in {"pending", "partial", "complete"}
+                        or any(type(cleanup.get(k)) is not int or cleanup[k] < 0 for k in ("files", "bytes"))):
+                    raise ArtifactError("ARTIFACT_MANIFEST_INVALID")
+                for field in ("decided_at", "closed_at"):
+                    value = closeout.get(field)
+                    if value is None and field == "closed_at" and doc["state"] != "closed":
+                        continue
+                    if type(value) not in {int, float} or not math.isfinite(value):
+                        raise ArtifactError("ARTIFACT_MANIFEST_INVALID")
+            elif doc["state"] in {"closed", "closeout_pending"}:
+                raise ArtifactError("ARTIFACT_MANIFEST_INVALID")
+            if doc.get("gc") is not None and not isinstance(doc["gc"], dict):
                 raise ArtifactError("ARTIFACT_MANIFEST_INVALID")
             self.verify()
         except BaseException as exc:
@@ -241,6 +261,8 @@ def _stopped(lease: RunLease) -> None:
             or type(owner.get("start_time_ticks")) is not int):
         raise ArtifactError("ARTIFACT_RUN_UNKNOWN")
     state, _ = sup.identity_state(owner)
+    if state == "gone" and sup.process_identity(owner["pid"]) is None and Path("/proc", str(owner["pid"])).exists():
+        raise ArtifactError("ARTIFACT_OWNER_LIVE_OR_UNKNOWN")
     if state not in {"gone", "mismatch"}:
         raise ArtifactError("ARTIFACT_OWNER_LIVE_OR_UNKNOWN")
 

@@ -2163,6 +2163,13 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         result["diagnostics"] = _diagnostics_snapshot(
             state or {}, parser, error, [finish_error] if (
                 finish_error is not None and error is not finish_error) else None)
+        if artifact_lease is not None and artifact_started:
+            try:
+                result["artifacts"] = artifact_lease.finish(result)
+            except (artifacts.ArtifactError, OSError, ValueError):
+                result["artifacts"] = {"state": "unknown", "acceptance": "pending",
+                                       "run_dir": str(artifact_lease.path),
+                                       "housekeeping_error": "ARTIFACT_RECORD_FAILED"}
         # Logs are retention, not execution control: failures degrade the log
         # and never rewrite a healthy task result into a log-limit failure.
         if logs is not None:
@@ -2189,15 +2196,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         for signum, previous in old_signals.items():
             signal.signal(signum, previous)
         if artifact_lease is not None:
-            try:
-                if artifact_started:
-                    result["artifacts"] = artifact_lease.finish(result)
-            except (artifacts.ArtifactError, OSError, ValueError):
-                result["artifacts"] = {"state": "unknown", "acceptance": "pending",
-                                       "run_dir": str(artifact_lease.path),
-                                       "housekeeping_error": "ARTIFACT_RECORD_FAILED"}
-            finally:
-                artifact_lease.close()
+            artifact_lease.close()
     return result
 
 
