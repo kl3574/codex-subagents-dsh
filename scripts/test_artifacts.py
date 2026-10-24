@@ -54,6 +54,19 @@ class ArtifactCLITests(unittest.TestCase):
     def prepare(self):
         return self.manage("prepare", "--config", str(self.config), "--cwd", str(self.cwd))
 
+    def manage_at(self, now, *args, expected=0):
+        code = """import sys
+from unittest.mock import patch
+import manage_dsh
+with patch('artifacts.time.time', return_value=float(sys.argv[1])):
+    sys.exit(manage_dsh.main(sys.argv[2:]))
+"""
+        result = subprocess.run([sys.executable, "-c", code, str(now), *args], cwd=SCRIPTS,
+                                capture_output=True, text=True, timeout=15)
+        value = json.loads(result.stdout)
+        self.assertEqual(result.returncode, expected, value)
+        return value
+
     def run_task(self, run, task=None, *extra, expected=0):
         result = subprocess.run(
             [sys.executable, str(SCRIPTS / "run_dsh.py"), "--config", str(self.config),
@@ -237,6 +250,149 @@ with patch('os.unlink', failing):
         closed = self.finalize(run)
         self.assertEqual(closed["artifact_state"], "closed")
         self.assertEqual(json.loads((Path(run["run_dir"]) / "run.json").read_text())["execution"], before)
+
+    def test_gc_preview_seven_day_boundary_and_protected_evidence(self):
+        run = self.prepare()
+        self.run_task(run)
+        evidence = Path(run["evidence_dir"]) / "result"
+        evidence.write_text("retain")
+        now = time.time()
+        self.manage_at(now, "finalize", "--run-dir", run["run_dir"],
+                       "--disposition", "accepted", "--delivered")
+        diagnostics = Path(run["diagnostics_dir"])
+        before = {p: p.read_bytes() for p in Path(run["run_dir"]).rglob("*") if p.is_file()}
+        early = self.manage_at(now + 7 * 86400 - .001, "gc", "--config", str(self.config), "--dry-run")
+        self.assertEqual(early["runs"][0]["reason"], "retention_not_elapsed")
+        preview = self.manage_at(now + 7 * 86400, "gc", "--config", str(self.config), "--dry-run")
+        self.assertEqual(preview["runs"][0]["reason"], "eligible")
+        self.assertEqual(before, {p: p.read_bytes() for p in Path(run["run_dir"]).rglob("*") if p.is_file()})
+        collected = self.manage_at(now + 7 * 86400, "gc", "--config", str(self.config),
+                                   "--expected-plan", preview["plan_token"])
+        self.assertEqual(collected["runs"][0]["reason"], "collected")
+        self.assertEqual(list(diagnostics.iterdir()), [])
+        self.assertEqual(evidence.read_text(), "retain")
+        again = self.manage_at(now + 7 * 86400 + 1, "gc", "--config", str(self.config))
+        self.assertEqual(again["runs"][0]["reason"], "already_collected")
+
+    def test_gc_skips_unclosed_protected_busy_unknown_and_unmanaged(self):
+        import fcntl
+        runs = [self.prepare() for _ in range(5)]
+        now = time.time()
+        for i, run in enumerate(runs):
+            (Path(run["diagnostics_dir"]) / "log").write_text("keep")
+            if i < 3:
+                self.manage_at(now, "finalize", "--run-dir", run["run_dir"], "--disposition", "abandoned")
+        (Path(runs[0]["diagnostics_dir"]) / ".keep").touch()
+        lock = open(Path(runs[1]["run_dir"]) / "lease.lock", "rb")
+        self.addCleanup(lock.close)
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        manifest = Path(runs[3]["run_dir"]) / "run.json"
+        doc = json.loads(manifest.read_text())
+        doc["state"] = "unknown"
+        manifest.write_text(json.dumps(doc))
+        unmanaged = self.home / "logs" / "old"
+        unmanaged.parent.mkdir()
+        unmanaged.write_text("legacy")
+        before = {p: p.read_bytes() for p in self.home.rglob("*") if p.is_file()}
+        preview = self.manage_at(now + 8 * 86400, "gc", "--config", str(self.config), "--dry-run")
+        self.assertEqual(before, {p: p.read_bytes() for p in self.home.rglob("*") if p.is_file()})
+        reasons = {row["run_id"]: row["reason"] for row in preview["runs"]}
+        self.assertEqual([reasons[r["run_id"]] for r in runs],
+                         ["protected", "ARTIFACT_RUN_BUSY", "eligible", "unknown", "not_closed"])
+        self.manage_at(now + 8 * 86400, "gc", "--config", str(self.config))
+        self.assertEqual(unmanaged.read_text(), "legacy")
+        for i, run in enumerate(runs):
+            self.assertEqual((Path(run["diagnostics_dir"]) / "log").exists(), i != 2)
+
+    def test_gc_revalidates_preview_and_automatic_passes_are_bounded_and_fair(self):
+        now = time.time()
+        held = [self.prepare() for _ in range(5)]
+        expired = [self.prepare() for _ in range(6)]
+        for run in expired:
+            (Path(run["diagnostics_dir"]) / "log").write_text("ordinary")
+            self.manage_at(now, "finalize", "--run-dir", run["run_dir"], "--disposition", "abandoned")
+        preview = self.manage_at(now + 8 * 86400, "gc", "--config", str(self.config), "--dry-run")
+        changed = Path(expired[0]["diagnostics_dir"]) / "log"
+        changed.write_text("new content")
+        refusal = self.manage_at(now + 8 * 86400, "gc", "--config", str(self.config),
+                                  "--expected-plan", preview["plan_token"], expected=2)
+        self.assertEqual(refusal["reason"], "ARTIFACT_PLAN_CHANGED")
+        self.assertTrue(changed.is_file())
+        for _ in range(6):
+            new = self.manage_at(now + 8 * 86400, "prepare", "--config", str(self.config), "--cwd", str(self.cwd))
+            self.assertLessEqual(len(new["housekeeping"]["runs"]), 4)
+        self.assertTrue(all(not list(Path(r["diagnostics_dir"]).iterdir()) for r in expired))
+        self.assertTrue(all(Path(r["run_dir"]).is_dir() for r in held))
+
+    def test_opportunistic_gc_failure_does_not_fail_preparation_and_manual_retry_works(self):
+        run = self.prepare()
+        now = time.time()
+        diagnostic = Path(run["diagnostics_dir"]) / "fail"
+        diagnostic.write_text("diagnostic")
+        self.manage_at(now, "finalize", "--run-dir", run["run_dir"], "--disposition", "abandoned")
+        code = """import os, sys
+from unittest.mock import patch
+import manage_dsh
+original = os.unlink
+def failing(path, *args, **kwargs):
+    if path == 'fail':
+        raise PermissionError('controlled filesystem failure')
+    return original(path, *args, **kwargs)
+with patch('os.unlink', failing), patch('artifacts.time.time', return_value=float(sys.argv[1])):
+    sys.exit(manage_dsh.main(sys.argv[2:]))
+"""
+        result = subprocess.run([sys.executable, "-c", code, str(now + 8 * 86400),
+                                 "prepare", "--config", str(self.config), "--cwd", str(self.cwd)],
+                                cwd=SCRIPTS, capture_output=True, text=True, timeout=10)
+        value = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 0, value)
+        self.assertTrue(value["ok"])
+        self.assertFalse(value["housekeeping"]["ok"])
+        self.assertEqual(value["housekeeping"]["warnings"][0]["code"], "ARTIFACT_GC_FAILED")
+        self.assertTrue(diagnostic.exists())
+        self.manage_at(now + 8 * 86400, "gc", "--config", str(self.config))
+        self.assertFalse(diagnostic.exists())
+
+    def test_followup_session_uses_new_run_and_old_gc_preserves_outputs_and_history(self):
+        first = self.prepare()
+        original = self.run_task(first)
+        evidence = Path(first["evidence_dir"]) / "delivered"
+        evidence.write_text("retained result")
+        now = time.time()
+        self.manage_at(now, "finalize", "--run-dir", first["run_dir"],
+                       "--disposition", "accepted", "--delivered")
+        second = self.prepare()
+        recovery = Path(second["scratch_dir"]) / "followup"
+        recovery.write_text("retain until accepted")
+        followup = self.run_task(second, {"mode": "capture"}, "--session-id", original["session_id"])
+        self.assertEqual(followup["session_id"], original["session_id"])
+        self.assertEqual(followup["resume_metadata"], "matched_official_check_required")
+        session_files = list((self.home / ".codex-dsh-wrapper" / "sessions").iterdir())
+        history = {p: p.read_bytes() for p in session_files}
+        self.manage_at(now + 8 * 86400, "gc", "--config", str(self.config))
+        self.assertEqual(list(Path(first["diagnostics_dir"]).iterdir()), [])
+        self.assertTrue(list(Path(second["diagnostics_dir"]).iterdir()))
+        self.assertEqual(evidence.read_text(), "retained result")
+        self.assertEqual(recovery.read_text(), "retain until accepted")
+        self.assertEqual(history, {p: p.read_bytes() for p in session_files})
+
+    def test_gc_refuses_link_and_replaced_diagnostic_directory(self):
+        run = self.prepare()
+        now = time.time()
+        self.manage_at(now, "finalize", "--run-dir", run["run_dir"], "--disposition", "abandoned")
+        target = self.cwd / "protected"
+        target.write_text("keep")
+        diagnostic = Path(run["diagnostics_dir"])
+        (diagnostic / "link").symlink_to(target)
+        sweep = self.manage_at(now + 8 * 86400, "gc", "--config", str(self.config))
+        self.assertEqual(sweep["runs"][0]["reason"], "ARTIFACT_ENTRY_UNSAFE")
+        self.assertEqual(target.read_text(), "keep")
+        diagnostic.rename(diagnostic.with_name("saved-diagnostics"))
+        diagnostic.mkdir()
+        (diagnostic / "replacement").write_text("keep replacement")
+        sweep = self.manage_at(now + 8 * 86400, "gc", "--config", str(self.config))
+        self.assertEqual(sweep["runs"][0]["reason"], "ARTIFACT_TARGET_CHANGED")
+        self.assertEqual((diagnostic / "replacement").read_text(), "keep replacement")
 
     def test_prepare_allocates_private_unique_owned_storage_without_model(self):
         first, second = self.prepare(), self.prepare()

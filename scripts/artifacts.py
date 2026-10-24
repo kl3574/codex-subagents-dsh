@@ -1,9 +1,11 @@
 """Owned run storage and artifact closeout, separate from process cleanup."""
 from __future__ import annotations
 
+from contextlib import contextmanager, ExitStack
 import json
 import fcntl
 import hashlib
+import math
 import os
 from pathlib import Path
 import shutil
@@ -17,6 +19,8 @@ import supervision as sup
 MANIFEST = "run.json"
 SCHEMA_VERSION = 1
 DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+RETENTION_SECONDS = 7 * 86400
+AUTO_GC_LIMIT = 4
 
 
 class ArtifactError(Exception):
@@ -362,6 +366,179 @@ def finalize_run(path: str | Path, disposition: str, delivered: bool = False,
         raise ArtifactError("ARTIFACT_IO_FAILED") from None
 
 
+@contextmanager
+def _index(home: Path, create: bool = False):
+    """Fixed 32-byte IDs + an 8-byte cursor: bounded reads, fair round robin.
+
+    The index is only a candidate queue, never deletion authority. Every selected
+    run still needs its own manifest, lease, identity and eligibility checks.
+    """
+    root = home / ".codex-dsh-wrapper" / "runs"
+    try:
+        parent = _open_directory(root)
+    except FileNotFoundError:
+        raise ArtifactError("ARTIFACT_INDEX_MISSING") from None
+    fd = None
+    try:
+        flags = os.O_NOFOLLOW | os.O_NONBLOCK | (os.O_RDWR | os.O_CREAT if create else os.O_RDONLY)
+        try:
+            fd = os.open("gc-index", flags, 0o600, dir_fd=parent)
+        except FileNotFoundError:
+            raise ArtifactError("ARTIFACT_INDEX_MISSING") from None
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_size % 32):
+            raise ArtifactError("ARTIFACT_INDEX_UNSAFE")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ArtifactError("ARTIFACT_GC_BUSY") from None
+        yield root, parent, fd
+    finally:
+        if fd is not None:
+            os.close(fd)
+        os.close(parent)
+
+
+def _enqueue(home: Path, run_id: str) -> None:
+    with _index(home, create=True) as (_, _, fd):
+        os.lseek(fd, 0, os.SEEK_END)
+        if os.write(fd, run_id.encode("ascii")) != 32:
+            raise ArtifactError("ARTIFACT_INDEX_WRITE_FAILED")
+        os.fsync(fd)
+
+
+def _gc_reason(lease: RunLease, now: float) -> str:
+    doc = lease.document
+    if doc["state"] != "closed":
+        return "unknown" if doc["state"] in {"running", "unknown"} else "not_closed"
+    _stopped(lease)
+    closeout = doc.get("closeout")
+    if not isinstance(closeout, dict):
+        return "unknown"
+    closed_at = closeout.get("closed_at")
+    if type(closed_at) not in {int, float} or not math.isfinite(closed_at):
+        return "unknown"
+    if now - closed_at < RETENTION_SECONDS:
+        return "retention_not_elapsed"
+    if (doc.get("gc") or {}).get("status") == "complete":
+        return "already_collected"
+    fd = os.open("diagnostics", DIRECTORY_FLAGS, dir_fd=lease.fd)
+    try:
+        try:
+            os.stat(".keep", dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            return "protected"
+    finally:
+        os.close(fd)
+    return "eligible"
+
+
+def gc_runs(home: Path, dry_run: bool = False, limit: int = 16,
+            expected_plan: str | None = None) -> dict[str, Any]:
+    if type(limit) is not int or not 1 <= limit <= 64:
+        raise ArtifactError("ARTIFACT_GC_LIMIT_INVALID")
+    response: dict[str, Any] = {"ok": True, "tool": "manage_dsh", "action": "gc",
+                               "dry_run": dry_run, "runs": [], "warnings": []}
+    try:
+        with _index(home) as (root, parent, index), ExitStack() as stack:
+            total = os.fstat(index).st_size // 32
+            cursor = 0
+            try:
+                cursor_fd = os.open("gc-cursor", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+            except FileNotFoundError:
+                pass
+            else:
+                with os.fdopen(cursor_fd, "rb") as handle:
+                    info = os.fstat(handle.fileno())
+                    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size != 8:
+                        raise ArtifactError("ARTIFACT_CURSOR_UNSAFE")
+                    cursor = int.from_bytes(handle.read(8), "big")
+            cursor = cursor % total if total else 0
+            plans = []
+            candidates = []
+            now = time.time()
+            for offset in range(min(limit, total)):
+                os.lseek(index, ((cursor + offset) % total) * 32, os.SEEK_SET)
+                run_id = os.read(index, 32).decode("ascii")
+                if len(run_id) != 32 or any(c not in "0123456789abcdef" for c in run_id):
+                    raise ArtifactError("ARTIFACT_INDEX_UNSAFE")
+                row = {"run_id": run_id, "reason": "unknown"}
+                response["runs"].append(row)
+                try:
+                    lease = stack.enter_context(RunLease(root / run_id))
+                    row["reason"] = _gc_reason(lease, now)
+                    entries = None
+                    if row["reason"] == "eligible":
+                        fd = os.open("diagnostics", DIRECTORY_FLAGS, dir_fd=lease.fd)
+                        stack.callback(os.close, fd)
+                        entries = _snapshot(fd, lease.document["identity"]["device"])
+                        candidates.append((lease, fd, entries, row))
+                    plans.append([run_id, row["reason"], lease.document, entries])
+                except (ArtifactError, OSError) as exc:
+                    row["reason"] = getattr(exc, "code", "ARTIFACT_IO_FAILED")
+                    plans.append([run_id, row["reason"]])
+            token = hashlib.sha256(json.dumps([cursor, plans], sort_keys=True,
+                                              separators=(",", ":")).encode()).hexdigest()
+            response["plan_token"] = token
+            if expected_plan is not None and expected_plan != token:
+                raise ArtifactError("ARTIFACT_PLAN_CHANGED")
+            if dry_run:
+                return response
+            # Revalidate the queue's pathname before committing any sweep effects.
+            if _identity(os.stat("gc-index", dir_fd=parent, follow_symlinks=False)) != _identity(os.fstat(index)):
+                raise ArtifactError("ARTIFACT_TARGET_CHANGED")
+            for lease, fd, entries, row in candidates:
+                counts = {"files": 0, "bytes": 0}
+                try:
+                    lease.verify()
+                    if _gc_reason(lease, time.time()) != "eligible" or _snapshot(fd, lease.document["identity"]["device"]) != entries:
+                        raise ArtifactError("ARTIFACT_PLAN_CHANGED")
+                    _remove_snapshot(fd, entries, counts)
+                    if os.listdir(fd):
+                        raise ArtifactError("ARTIFACT_TARGET_CHANGED")
+                    lease.verify()
+                    lease.document["gc"] = {**counts, "status": "complete", "collected_at": time.time()}
+                    lease.save()
+                    row.update(reason="collected", **counts)
+                except (ArtifactError, OSError) as exc:
+                    row.update(reason="partial", error=getattr(exc, "code", "ARTIFACT_GC_FAILED"), **counts)
+                    response["ok"] = False
+                    response["warnings"].append({"run_id": row["run_id"], "code": row["error"]})
+            next_cursor = (cursor + len(response["runs"])) % total if total else 0
+            name = ".cursor-" + uuid.uuid4().hex
+            try:
+                fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=parent)
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(next_cursor.to_bytes(8, "big"))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(name, "gc-cursor", src_dir_fd=parent, dst_dir_fd=parent)
+                os.fsync(parent)
+            finally:
+                try:
+                    os.unlink(name, dir_fd=parent)
+                except FileNotFoundError:
+                    pass
+        return response
+    except ArtifactError as exc:
+        if exc.code == "ARTIFACT_INDEX_MISSING":
+            # No managed queue yet: do not adopt historical directories.
+            return response
+        raise
+    except (OSError, ValueError, UnicodeError):
+        raise ArtifactError("ARTIFACT_GC_IO_FAILED") from None
+
+
+def opportunistic_gc(home: Path) -> dict[str, Any]:
+    try:
+        return gc_runs(home, limit=AUTO_GC_LIMIT)
+    except ArtifactError as exc:
+        return {"ok": False, "warnings": [{"code": exc.code}]}
+
+
 def prepare_run(config_path: str | Path, cwd: str | Path) -> dict[str, Any]:
     home = _home(config_path)
     try:
@@ -402,6 +579,15 @@ def prepare_run(config_path: str | Path, cwd: str | Path) -> dict[str, Any]:
         if created:
             shutil.rmtree(directory)
         raise ArtifactError("ARTIFACT_PREPARE_FAILED") from None
+    warnings = []
+    try:
+        _enqueue(home, run_id)
+    except (ArtifactError, OSError) as exc:
+        warnings.append({"code": getattr(exc, "code", "ARTIFACT_INDEX_WRITE_FAILED")})
+    housekeeping = opportunistic_gc(home)
+    housekeeping["warnings"] = warnings + housekeeping.get("warnings", [])
+    if warnings:
+        housekeeping["ok"] = False
     return {
         "ok": True,
         "tool": "manage_dsh",
@@ -413,4 +599,5 @@ def prepare_run(config_path: str | Path, cwd: str | Path) -> dict[str, Any]:
         "diagnostics_dir": str(directory / "diagnostics"),
         "status_file": str(directory / "diagnostics" / "status.json"),
         "artifact_state": "prepared",
+        "housekeeping": housekeeping,
     }

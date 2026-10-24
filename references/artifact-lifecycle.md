@@ -43,3 +43,29 @@ python3 scripts/manage_dsh.py finalize --run-dir DIR --disposition accepted --de
 `closeout_pending` 与错误码，修复文件系统原因后重试相同命令；成功后才开始
 7 天保留期。执行结果不会因清理结果被改写。未经 `--run-dir` 的旧调用仍可使用，
 返回 `artifacts.state=unmanaged`，其文件不纳入自动清理。
+
+## 诊断回收
+
+```bash
+python3 scripts/manage_dsh.py gc --config CONFIG --dry-run
+python3 scripts/manage_dsh.py gc --config CONFIG --expected-plan TOKEN
+```
+
+可直接省略 `--expected-plan` 执行当前重新验证的计划。默认每次检查 16 个运行，
+`--limit` 接受 1–64。每次 prepare 和成功 finalize 自动检查最多 4 个运行；
+无后台服务。预览不创建或修改文件，也不推进游标。
+
+工具创建的运行 ID 进入固定宽度候选索引，轮转游标确保活动或被保留的早期运行
+不永久挡住后面的到期运行。每次扫描仅读取本批 ID；每个诊断树最多检查 10,000
+项、64 层。索引不授予删除权限，每个候选仍必须通过独立目录、manifest、lease、
+身份和到期检查。索引只增长 32 字节/运行，游标固定 8 字节，不记录文件列表或任务内容。
+索引损坏或不可写会单独报告 housekeeping 警告；不扫描旧目录补齐，不更改执行结果。
+
+普通诊断在 `closed_at + 7 天` 起可回收。在 `diagnostics/` 内放置 `.keep` 可保留
+整棵诊断树；长期证据优先放在 evidence。GC 跳过未关闭、UNKNOWN、活动/锁定、
+未到期、受保护或身份不符的运行，并给出原因。成功后留下有界回收记录，重复扫描
+跳过已回收目录。部分失败报告已删除数量和错误码，保留剩余文件，可再次执行 GC。
+
+自动回收错误位于 `housekeeping.warnings`，prepare/finalize 的有效主结果保持不变。
+手动 GC 或 finalize 的部分删除失败退出码为 6；参数或安全校验拒绝为 2。
+安装与升级自身不会触发 GC，也不会清理历史未受管文件。
