@@ -78,7 +78,8 @@ description: 把明确、限定范围的子任务通过普通 Codex subagent 交
    ```
 
    可选 `--profile NAME`、重复有序的 `--patch /absolute/file.yml`、
-   `--session-id ID`、显式 `--timeout SECONDS` 和 `--status-file ABSOLUTE_NEW_PATH`。
+   `--session-id ID` 和显式 `--timeout SECONDS`；受管状态路径自动选择，若显式传
+   `--status-file`，必须使用 prepare 返回的路径。仅旧的未受管调用可另选新路径。
    默认 profile 与 `default_patches` 来自 bridge；本次覆盖不写回 profile。
 3. 返回完整结构化结果及必要摘要，不输出 `.env`、完整环境、认证头或密钥。
    恢复 session 时保持相同 DSH_HOME、cwd、profile 和有序 patches；不自动重跑

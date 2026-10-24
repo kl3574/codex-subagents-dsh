@@ -26,6 +26,7 @@ secret-redacted.
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import ctypes
 import hashlib
 import json
@@ -1813,6 +1814,13 @@ def _terminal_state(error: dict[str, Any] | None) -> str:
 
 
 def execute(args: argparse.Namespace) -> dict[str, Any]:
+    # Public execute() can run in a long-lived process. Release the artifact
+    # lease even if final result/log serialization raises unexpectedly.
+    with ExitStack() as resources:
+        return _execute(args, resources)
+
+
+def _execute(args: argparse.Namespace, resources: ExitStack) -> dict[str, Any]:
     started = time.monotonic()
     result = _base_result()
     prepared: Prepared | None = None
@@ -1838,6 +1846,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         supervisor_identity = sup.process_identity(os.getpid())
         if getattr(args, "run_dir", None) is not None:
             artifact_lease = artifacts.RunLease(args.run_dir)
+            resources.callback(artifact_lease.close)
             owned_status = artifact_lease.path / "diagnostics" / "status.json"
             if prepared.status_file is not None and prepared.status_file != owned_status:
                 raise artifacts.ArtifactError("ARTIFACT_STATUS_CONFLICT")
@@ -1888,6 +1897,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 raise BridgeError(status_error["category"], status_error["code"]) from None
         try:
             logs = BoundedLog(prepared.log_root, prepared.limits["max_log_bytes"])
+            resources.callback(logs.close)
             result["log_dir"] = str(logs.path)
         except (OSError, ValueError):
             logs = None
@@ -1925,6 +1935,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                     stop_signal["signum"] = signum
             for signum in (signal.SIGTERM, signal.SIGINT):
                 old_signals[signum] = signal.signal(signum, on_signal)
+                resources.callback(signal.signal, signum, old_signals[signum])
         old_subreaper = _subreaper(True)
         try:
             process = subprocess.Popen(prepared.command, cwd=prepared.cwd, env=prepared.env,

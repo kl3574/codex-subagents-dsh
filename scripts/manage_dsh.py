@@ -209,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
                                               args.dry_run, args.expected_plan)
             code = 0 if response["ok"] else 6
             if not args.dry_run and response["artifact_state"] == "closed":
-                response["housekeeping"] = artifacts.opportunistic_gc(Path(args.run_dir).parent.parent.parent)
+                response["housekeeping"] = artifacts.opportunistic_gc(Path(response["dsh_home"]), args.run_dir)
         elif args.command == "gc":
             response = artifacts.gc_runs(artifacts._home(args.config), args.dry_run,
                                          args.limit, args.expected_plan)

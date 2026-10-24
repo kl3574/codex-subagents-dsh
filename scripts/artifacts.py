@@ -144,8 +144,11 @@ class RunLease:
                         raise ArtifactError("ARTIFACT_MANIFEST_INVALID")
             elif doc["state"] in {"closed", "closeout_pending"}:
                 raise ArtifactError("ARTIFACT_MANIFEST_INVALID")
-            if doc.get("gc") is not None and not isinstance(doc["gc"], dict):
-                raise ArtifactError("ARTIFACT_MANIFEST_INVALID")
+            gc = doc.get("gc")
+            if gc is not None:
+                if (not isinstance(gc, dict) or gc.get("status") not in {"pending", "partial", "complete"}
+                        or any(type(gc.get(k)) is not int or gc[k] < 0 for k in ("files", "bytes"))):
+                    raise ArtifactError("ARTIFACT_MANIFEST_INVALID")
             self.verify()
         except BaseException as exc:
             self.close()
@@ -345,7 +348,8 @@ def finalize_run(path: str | Path, disposition: str, delivered: bool = False,
             if closeout is not None and closeout["disposition"] != disposition:
                 raise ArtifactError("ARTIFACT_DISPOSITION_CONFLICT")
             base = {"ok": True, "tool": "manage_dsh", "action": "finalize",
-                    "run_id": doc["run_id"], "run_dir": str(lease.path), "dry_run": dry_run}
+                    "run_id": doc["run_id"], "run_dir": str(lease.path),
+                    "dsh_home": doc["dsh_home"], "dry_run": dry_run}
             if doc["state"] == "closed":
                 return {**base, "artifact_state": "closed", "closeout": closeout}
             fd = os.open("scratch", DIRECTORY_FLAGS, dir_fd=lease.fd)
@@ -380,7 +384,13 @@ def finalize_run(path: str | Path, disposition: str, delivered: bool = False,
                 except (OSError, ArtifactError) as exc:
                     counts.update(status="partial", error=getattr(exc, "code", "ARTIFACT_CLEANUP_FAILED"))
                     base["ok"] = False
-                lease.save()
+                try:
+                    lease.save()
+                except (ArtifactError, OSError) as exc:
+                    doc["state"] = "closeout_pending"
+                    closeout["closed_at"] = None
+                    counts.update(status="partial", error=getattr(exc, "code", "ARTIFACT_CLOSEOUT_RECORD_FAILED"))
+                    base["ok"] = False
                 return {**base, "artifact_state": doc["state"], "closeout": closeout}
             finally:
                 os.close(fd)
@@ -389,7 +399,7 @@ def finalize_run(path: str | Path, disposition: str, delivered: bool = False,
 
 
 @contextmanager
-def _index(home: Path, create: bool = False):
+def _index(home: Path, create: bool = False, lock_wait: float = 0.0):
     """Fixed 32-byte IDs + an 8-byte cursor: bounded reads, fair round robin.
 
     The index is only a candidate queue, never deletion authority. Every selected
@@ -409,12 +419,25 @@ def _index(home: Path, create: bool = False):
             raise ArtifactError("ARTIFACT_INDEX_MISSING") from None
         info = os.fstat(fd)
         if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
-                or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_size % 32):
+                or info.st_uid != os.getuid() or info.st_mode & 0o077):
             raise ArtifactError("ARTIFACT_INDEX_UNSAFE")
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise ArtifactError("ARTIFACT_GC_BUSY") from None
+        deadline = time.monotonic() + lock_wait
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise ArtifactError("ARTIFACT_GC_BUSY") from None
+                time.sleep(.01)
+        size = os.fstat(fd).st_size
+        if size % 32:
+            if not create:
+                raise ArtifactError("ARTIFACT_INDEX_UNSAFE")
+            # An incomplete append never published a whole candidate ID. Recover
+            # only that tail; complete records are never discarded or invented.
+            os.ftruncate(fd, size - size % 32)
+            os.fsync(fd)
         yield root, parent, fd
     finally:
         if fd is not None:
@@ -422,12 +445,42 @@ def _index(home: Path, create: bool = False):
         os.close(parent)
 
 
-def _enqueue(home: Path, run_id: str) -> None:
-    with _index(home, create=True) as (_, _, fd):
-        os.lseek(fd, 0, os.SEEK_END)
-        if os.write(fd, run_id.encode("ascii")) != 32:
-            raise ArtifactError("ARTIFACT_INDEX_WRITE_FAILED")
-        os.fsync(fd)
+def register_run(path: str | Path) -> None:
+    with RunLease(path) as lease:
+        doc = lease.document
+        with _index(Path(doc["dsh_home"]), create=True, lock_wait=1.0) as (_, _, fd):
+            size = os.fstat(fd).st_size
+            slot = doc.get("index_slot")
+            if type(slot) is int and 0 <= slot * 32 < size:
+                os.lseek(fd, slot * 32, os.SEEK_SET)
+                if os.read(fd, 32) == doc["run_id"].encode("ascii"):
+                    return
+            os.lseek(fd, size, os.SEEK_SET)
+            data = doc["run_id"].encode("ascii")
+            try:
+                while data:
+                    written = os.write(fd, data)
+                    if not written:
+                        raise ArtifactError("ARTIFACT_INDEX_WRITE_FAILED")
+                    data = data[written:]
+                os.fsync(fd)
+            except (OSError, ArtifactError):
+                os.ftruncate(fd, size)
+                raise
+            doc["index_slot"] = size // 32
+        lease.save()
+
+
+def _read_cursor(parent: int) -> int:
+    try:
+        fd = os.open("gc-cursor", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+    except FileNotFoundError:
+        return 0
+    with os.fdopen(fd, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size != 8:
+            raise ArtifactError("ARTIFACT_CURSOR_UNSAFE")
+        return int.from_bytes(handle.read(8), "big")
 
 
 def _gc_reason(lease: RunLease, now: float) -> str:
@@ -465,26 +518,21 @@ def gc_runs(home: Path, dry_run: bool = False, limit: int = 16,
     response: dict[str, Any] = {"ok": True, "tool": "manage_dsh", "action": "gc",
                                "dry_run": dry_run, "runs": [], "warnings": []}
     try:
-        with _index(home) as (root, parent, index), ExitStack() as stack:
+        with _index(home, create=not dry_run) as (root, parent, index), ExitStack() as stack:
             total = os.fstat(index).st_size // 32
-            cursor = 0
-            try:
-                cursor_fd = os.open("gc-cursor", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
-            except FileNotFoundError:
-                pass
-            else:
-                with os.fdopen(cursor_fd, "rb") as handle:
-                    info = os.fstat(handle.fileno())
-                    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size != 8:
-                        raise ArtifactError("ARTIFACT_CURSOR_UNSAFE")
-                    cursor = int.from_bytes(handle.read(8), "big")
-            cursor = cursor % total if total else 0
+            original_cursor = _read_cursor(parent)
+            cursor = original_cursor % total if total else 0
+            ids = []
+            for offset in range(min(limit, total)):
+                os.lseek(index, ((cursor + offset) % total) * 32, os.SEEK_SET)
+                ids.append(os.read(index, 32).decode("ascii"))
+            # The queue lock covers only its short metadata operations. Slow
+            # deletion/preview cannot prevent new runs from being registered.
+            fcntl.flock(index, fcntl.LOCK_UN)
             plans = []
             candidates = []
             now = time.time()
-            for offset in range(min(limit, total)):
-                os.lseek(index, ((cursor + offset) % total) * 32, os.SEEK_SET)
-                run_id = os.read(index, 32).decode("ascii")
+            for run_id in ids:
                 if len(run_id) != 32 or any(c not in "0123456789abcdef" for c in run_id):
                     raise ArtifactError("ARTIFACT_INDEX_UNSAFE")
                 row = {"run_id": run_id, "reason": "unknown"}
@@ -513,11 +561,14 @@ def gc_runs(home: Path, dry_run: bool = False, limit: int = 16,
             if _identity(os.stat("gc-index", dir_fd=parent, follow_symlinks=False)) != _identity(os.fstat(index)):
                 raise ArtifactError("ARTIFACT_TARGET_CHANGED")
             for lease, fd, entries, row in candidates:
-                counts = {"files": 0, "bytes": 0}
+                prior = lease.document.get("gc") or {}
+                counts = {"files": prior.get("files", 0), "bytes": prior.get("bytes", 0)}
                 try:
                     lease.verify()
                     if _gc_reason(lease, time.time()) != "eligible" or _snapshot(fd, lease.document["identity"]["device"]) != entries:
                         raise ArtifactError("ARTIFACT_PLAN_CHANGED")
+                    lease.document["gc"] = {**counts, "status": "pending", "collected_at": None}
+                    lease.save()
                     _remove_snapshot(fd, entries, counts)
                     if os.listdir(fd):
                         raise ArtifactError("ARTIFACT_TARGET_CHANGED")
@@ -529,7 +580,22 @@ def gc_runs(home: Path, dry_run: bool = False, limit: int = 16,
                     row.update(reason="partial", error=getattr(exc, "code", "ARTIFACT_GC_FAILED"), **counts)
                     response["ok"] = False
                     response["warnings"].append({"run_id": row["run_id"], "code": row["error"]})
+                    lease.document["gc"] = {**counts, "status": "partial", "collected_at": None,
+                                             "error": row["error"]}
+                    try:
+                        lease.save()
+                    except (ArtifactError, OSError):
+                        response["warnings"].append({"run_id": row["run_id"], "code": "ARTIFACT_GC_RECORD_FAILED"})
             next_cursor = (cursor + len(response["runs"])) % total if total else 0
+            try:
+                fcntl.flock(index, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                response["warnings"].append({"code": "ARTIFACT_GC_CURSOR_BUSY"})
+                response["ok"] = False
+                return response
+            # Another pass may have advanced while these runs were being swept.
+            if _read_cursor(parent) != original_cursor:
+                return response
             name = ".cursor-" + uuid.uuid4().hex
             try:
                 fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=parent)
@@ -554,11 +620,21 @@ def gc_runs(home: Path, dry_run: bool = False, limit: int = 16,
         raise ArtifactError("ARTIFACT_GC_IO_FAILED") from None
 
 
-def opportunistic_gc(home: Path) -> dict[str, Any]:
+def opportunistic_gc(home: Path, register: str | Path | None = None) -> dict[str, Any]:
+    warnings = []
+    if register is not None:
+        try:
+            register_run(register)
+        except (ArtifactError, OSError) as exc:
+            warnings.append({"code": getattr(exc, "code", "ARTIFACT_INDEX_WRITE_FAILED")})
     try:
-        return gc_runs(home, limit=AUTO_GC_LIMIT)
+        result = gc_runs(home, limit=AUTO_GC_LIMIT)
     except ArtifactError as exc:
-        return {"ok": False, "warnings": [{"code": exc.code}]}
+        result = {"ok": False, "warnings": [{"code": exc.code}]}
+    result["warnings"] = warnings + result.get("warnings", [])
+    if warnings:
+        result["ok"] = False
+    return result
 
 
 def prepare_run(config_path: str | Path, cwd: str | Path) -> dict[str, Any]:
@@ -601,15 +677,7 @@ def prepare_run(config_path: str | Path, cwd: str | Path) -> dict[str, Any]:
         if created:
             shutil.rmtree(directory)
         raise ArtifactError("ARTIFACT_PREPARE_FAILED") from None
-    warnings = []
-    try:
-        _enqueue(home, run_id)
-    except (ArtifactError, OSError) as exc:
-        warnings.append({"code": getattr(exc, "code", "ARTIFACT_INDEX_WRITE_FAILED")})
-    housekeeping = opportunistic_gc(home)
-    housekeeping["warnings"] = warnings + housekeeping.get("warnings", [])
-    if warnings:
-        housekeeping["ok"] = False
+    housekeeping = opportunistic_gc(home, directory)
     return {
         "ok": True,
         "tool": "manage_dsh",

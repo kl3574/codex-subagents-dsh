@@ -409,6 +409,176 @@ with patch('os.unlink', failing), patch('artifacts.time.time', return_value=floa
         self.assertEqual(response["reason"], "ARTIFACT_MANIFEST_INVALID")
         self.assertTrue(recovery.exists())
 
+    def test_closeout_receipt_write_failure_reports_retryable_partial_result(self):
+        run = self.prepare()
+        (Path(run["scratch_dir"]) / "temporary").write_text("temporary")
+        self.run_task(run)
+        code = """import os, sys
+from unittest.mock import patch
+import manage_dsh
+original = os.replace
+count = 0
+def failing(source, destination, *args, **kwargs):
+    global count
+    if destination == 'run.json':
+        count += 1
+        if count == 2:
+            raise PermissionError('controlled final receipt failure')
+    return original(source, destination, *args, **kwargs)
+with patch('os.replace', failing):
+    sys.exit(manage_dsh.main(sys.argv[1:]))
+"""
+        result = subprocess.run([sys.executable, "-c", code, "finalize", "--run-dir", run["run_dir"],
+                                 "--disposition", "accepted", "--delivered"], cwd=SCRIPTS,
+                                capture_output=True, text=True, timeout=10)
+        response = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 6, response)
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["artifact_state"], "closeout_pending")
+        self.assertEqual(response["closeout"]["disposition"], "accepted")
+        self.assertEqual(response["closeout"]["cleanup"]["status"], "partial")
+        self.assertIsNone(response["closeout"]["closed_at"])
+        self.assertEqual(self.finalize(run)["artifact_state"], "closed")
+
+    def test_prepare_registers_while_another_gc_is_deleting(self):
+        run = self.prepare()
+        now = time.time()
+        (Path(run["diagnostics_dir"]) / "slow").write_text("log")
+        self.manage_at(now, "finalize", "--run-dir", run["run_dir"], "--disposition", "abandoned")
+        gate, release = self.root / "gc-started", self.root / "gc-release"
+        code = """import os, sys, time
+from pathlib import Path
+from unittest.mock import patch
+import manage_dsh
+original = os.unlink
+def slow(path, *args, **kwargs):
+    if path == 'slow':
+        Path(sys.argv[2]).touch()
+        deadline = time.monotonic() + 8
+        while not Path(sys.argv[3]).exists() and time.monotonic() < deadline:
+            time.sleep(.01)
+    return original(path, *args, **kwargs)
+with patch('os.unlink', slow), patch('artifacts.time.time', return_value=float(sys.argv[1])):
+    sys.exit(manage_dsh.main(sys.argv[4:]))
+"""
+        process = subprocess.Popen([sys.executable, "-c", code, str(now + 8 * 86400),
+                                    str(gate), str(release), "gc", "--config", str(self.config)],
+                                   cwd=SCRIPTS, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.monotonic() + 5
+            while not gate.exists() and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertTrue(gate.exists())
+            new = self.prepare()
+            index = self.home / ".codex-dsh-wrapper" / "runs" / "gc-index"
+            self.assertIn(new["run_id"].encode(), index.read_bytes())
+        finally:
+            release.touch()
+            stdout, stderr = process.communicate(timeout=10)
+        self.assertEqual(process.returncode, 0, stdout + stderr)
+
+    def test_partial_gc_counts_survive_retry(self):
+        run = self.prepare()
+        now = time.time()
+        for name in ("one", "two"):
+            (Path(run["diagnostics_dir"]) / name).write_text("log")
+        self.manage_at(now, "finalize", "--run-dir", run["run_dir"], "--disposition", "abandoned")
+        code = """import os, sys
+from unittest.mock import patch
+import manage_dsh
+original = os.unlink
+count = 0
+def failing(path, *args, **kwargs):
+    global count
+    if path in ('one', 'two'):
+        count += 1
+        if count == 2:
+            raise PermissionError('controlled second deletion failure')
+    return original(path, *args, **kwargs)
+with patch('os.unlink', failing), patch('artifacts.time.time', return_value=float(sys.argv[1])):
+    sys.exit(manage_dsh.main(sys.argv[2:]))
+"""
+        result = subprocess.run([sys.executable, "-c", code, str(now + 8 * 86400),
+                                 "gc", "--config", str(self.config)], cwd=SCRIPTS,
+                                capture_output=True, text=True, timeout=10)
+        response = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 6, response)
+        manifest = Path(run["run_dir"]) / "run.json"
+        partial = json.loads(manifest.read_text()).get("gc")
+        self.assertIsNotNone(partial)
+        self.assertEqual(partial["status"], "partial")
+        self.assertEqual(partial["files"], 1)
+        self.manage_at(now + 8 * 86400, "gc", "--config", str(self.config))
+        final = json.loads(manifest.read_text())["gc"]
+        self.assertEqual(final["status"], "complete")
+        self.assertEqual(final["files"], 2)
+        self.assertEqual(final["bytes"], 6)
+
+    def test_wrapper_releases_lease_when_result_logging_raises(self):
+        from unittest.mock import patch
+        import run_dsh
+        run = self.prepare()
+        task = self.cwd / "borrowed.json"
+        task.write_text('{"mode":"capture"}')
+        args = run_dsh.build_parser().parse_args([
+            "--config", str(self.config), "--cwd", str(self.cwd),
+            "--task-file", str(task), "--run-dir", run["run_dir"]])
+        original = run_dsh.BoundedLog.document
+        def failing(log, name, value):
+            if name == "result.json":
+                raise RuntimeError("controlled result serialization failure")
+            return original(log, name, value)
+        with patch.object(run_dsh.BoundedLog, "document", failing):
+            with self.assertRaises(RuntimeError):
+                run_dsh.execute(args)
+        refusal = self.finalize(run, expected=2)
+        self.assertEqual(refusal["reason"], "ARTIFACT_OWNER_LIVE_OR_UNKNOWN")
+        self.assertEqual(task.read_text(), '{"mode":"capture"}')
+
+    def test_failed_registration_is_repaired_on_closeout_and_is_idempotent(self):
+        import fcntl
+        self.prepare()
+        index = self.home / ".codex-dsh-wrapper" / "runs" / "gc-index"
+        with index.open("rb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            run = self.prepare()
+            self.assertFalse(run["housekeeping"]["ok"])
+            self.assertNotIn(run["run_id"].encode(), index.read_bytes())
+        args = ("finalize", "--run-dir", run["run_dir"], "--disposition", "abandoned")
+        closed = self.manage(*args)
+        self.assertTrue(closed["housekeeping"]["ok"])
+        self.assertEqual(index.read_bytes().count(run["run_id"].encode()), 1)
+        self.manage(*args)
+        self.assertEqual(index.read_bytes().count(run["run_id"].encode()), 1)
+
+    def test_short_index_writes_and_incomplete_tail_recover_without_adoption(self):
+        code = """import os, sys
+from unittest.mock import patch
+import manage_dsh
+original = os.write
+def short(fd, data):
+    if os.readlink('/proc/self/fd/' + str(fd)).endswith('/gc-index'):
+        data = data[:max(1, len(data)//2)]
+    return original(fd, data)
+with patch('os.write', short):
+    sys.exit(manage_dsh.main(sys.argv[1:]))
+"""
+        result = subprocess.run([sys.executable, "-c", code, "prepare", "--config", str(self.config),
+                                 "--cwd", str(self.cwd)], cwd=SCRIPTS, text=True,
+                                capture_output=True, timeout=10)
+        run = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 0, run)
+        self.assertTrue(run["housekeeping"]["ok"])
+        index = Path(run["run_dir"]).parent / "gc-index"
+        complete = index.read_bytes()
+        self.assertEqual(complete, run["run_id"].encode())
+        with index.open("ab") as handle:
+            handle.write(b"incomplete")
+        self.manage("gc", "--config", str(self.config), "--dry-run", expected=2)
+        self.assertEqual(index.read_bytes(), complete + b"incomplete")
+        second = self.prepare()
+        self.assertEqual(index.read_bytes(), complete + second["run_id"].encode())
+
     def test_prepare_allocates_private_unique_owned_storage_without_model(self):
         first, second = self.prepare(), self.prepare()
         self.assertNotEqual(first["run_id"], second["run_id"])

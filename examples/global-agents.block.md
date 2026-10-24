@@ -20,8 +20,8 @@ defines the task, permissions, cwd, acceptance criteria, and independently verif
   returns evidence. It does not recursively delegate or write the target artifact itself.
 - Prepare one owned run per invocation and pass `--run-dir`. Put temporary inputs in its
   scratch directory or use stdin. After independent acceptance and delivery, the main agent
-  runs `manage_dsh.py finalize --disposition accepted --delivered`; explicit abandonment uses
-  `--disposition abandoned`. Preserve recovery material while pending or UNKNOWN. Check
+  runs `manage_dsh.py finalize --run-dir DIR --disposition accepted --delivered`; explicit
+  abandonment uses `--run-dir DIR --disposition abandoned`. Preserve recovery material while pending or UNKNOWN. Check
   housekeeping warnings separately; ordinary closed-run diagnostics have seven-day retention.
 - Report Harness completion separately from task acceptance. Do not automatically replay an
   unknown model request or treat a heartbeat as task progress. Without a native subagent tool,
