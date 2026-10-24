@@ -5,13 +5,14 @@ headless process through an ordinary Codex subagent launcher. The main agent own
 the task boundary and independently verifies the result; the launcher only starts
 the process and returns structured evidence.
 
-Version: **v0.1.1**. Ordinary runs have no default total deadline. Quiet periods
+Version: **v0.2.0**. Ordinary runs have no default total deadline. Quiet periods
 produce observations; explicit budgets, cancellation and confirmed execution errors
 have separate outcomes.
 
-This development checkout adds owned-run lifecycle commands on top of v0.1.1;
-those commands are not included in the v0.1.1 release tag. Install from this checkout
-to use them. No new release tag is implied.
+This release adds owned-run preparation, explicit main-agent closeout, and seven-day
+diagnostic retention. Evidence and session history remain protected. See the
+[lifecycle guide](references/artifact-lifecycle.md) and
+[acceptance record](docs/testing/artifact-lifecycle-acceptance.md).
 
 ## What it provides
 
@@ -37,7 +38,7 @@ skill destination contains a `.env` file, it refuses to copy it. Move that file 
 |---|---|
 | Linux/POSIX, Python 3.10+ | Supported and tested with the offline installer suite |
 | Node 22.19+ | Required by the supported headless launcher; the installer validates it |
-| `@deepseek-ai/dsh` 0.2.1-rc.2 | Template/profile initialization is verified; real model acceptance is NOT_RUN. The installer never installs or upgrades it |
+| `@deepseek-ai/dsh` 0.2.1-rc.3 | Used for real lifecycle return-value/session validation; see the acceptance record for scope. The installer never installs or upgrades it |
 | Windows | Not supported: the current wrapper refuses execution and process-tree cleanup is unverified |
 | macOS | Not verified |
 
@@ -53,7 +54,7 @@ steps, so review and run them yourself. Replace the repository URL with the cano
 release URL if you use a fork or mirror.
 
 ```bash
-git clone --branch v0.1.1 --depth 1 https://github.com/kl3574/codex-subagents-dsh.git
+git clone --branch v0.2.0 --depth 1 https://github.com/kl3574/codex-subagents-dsh.git
 cd codex-subagents-dsh
 python3 scripts/install.py --migrate-progress
 ```
@@ -84,7 +85,7 @@ Updating an existing installation is transactional:
 
 ```bash
 git -C codex-subagents-dsh fetch --tags
-git -C codex-subagents-dsh checkout v0.1.1
+git -C codex-subagents-dsh checkout v0.2.0
 python3 codex-subagents-dsh/scripts/install.py --migrate-progress
 ```
 
@@ -180,12 +181,13 @@ python3 "$HOME/.agents/skills/codex-subagents-dsh/scripts/test_run_dsh.py" \
 ```
 
 These checks cover installation, protocol boundaries, and configuration composition.
-The release also received separate real DeepSeek validation through native Codex
-launchers: normal completion after silence warnings, same-session continuation,
-live status observation and requested cancellation. Output hashes and cleanup were
-checked independently. Simulated tests cover failures that were not induced against
-the real API, including log exhaustion and post-final hangs. See the release notes
-for the tested version and results. `harness_completed` does not mean task acceptance.
+The lifecycle implementation also received separate real DeepSeek validation through
+native Codex launchers: bounded return values, same-session continuation, protected
+evidence retention and explicit closeout. An outside-workspace file-writing smoke
+was denied by the existing sandbox and was explicitly abandoned; permissions were
+not expanded. Fault and concurrency cases use controlled fixtures. See the
+[acceptance record](docs/testing/artifact-lifecycle-acceptance.md) for review outcomes,
+earlier validation and limits. `harness_completed` does not mean task acceptance.
 
 ## Run a task
 

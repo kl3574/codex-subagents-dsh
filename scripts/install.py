@@ -33,7 +33,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
-VERSION = "0.1.1"
+VERSION = "0.2.0"
 SKILL_NAME = "codex-subagents-dsh"
 def _default_dest() -> Path:
     return Path.home() / ".agents" / "skills" / SKILL_NAME
