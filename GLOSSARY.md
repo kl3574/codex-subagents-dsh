@@ -29,3 +29,28 @@ _Avoid_: treating Harness completion as task acceptance.
 **Process cleanup**:
 Termination and reaping of processes owned by a run.
 _Avoid_: using this term to imply that task files or artifacts were removed.
+
+**Owned run directory**:
+A separate directory created for one run by the lifecycle tool. It contains only
+that run's managed temporary material, diagnostics, and closeout records.
+
+**Borrowed input**:
+A file supplied to a run that remains owned by its caller. Passing it to Harness
+does not grant the lifecycle tool authority to remove it.
+
+**Scratch**:
+Disposable working material created inside an owned run directory. It remains
+available while the main agent is evaluating or recovering the task.
+
+**Artifact closeout**:
+The main agent's explicit decision that a run has been accepted or abandoned,
+followed by housekeeping of eligible owned files.
+_Avoid_: process cleanup, or automatic acceptance on Harness exit.
+
+**Diagnostics**:
+Run observations retained for troubleshooting. They are distinct from final
+deliverables, deliberately retained evidence, and Harness session history.
+
+**Recovery protection**:
+Retention of a run's scratch and recovery evidence while the run is unfinished,
+unaccepted, or awaiting an explicit closeout decision.
