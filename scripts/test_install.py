@@ -364,6 +364,168 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse((self.dest / "obsolete.txt").exists())
         self.assertEqual((self.dest / "keep.txt").read_text(encoding="utf-8"), "unknown\n")
 
+    # ------------------------------------------------------- source validation
+    def test_missing_artifacts_source_is_rejected_without_writes(self):
+        source = self.copy_source("source-missing-artifacts")
+        (source / "scripts" / "artifacts.py").unlink()
+        _, report = self.run_install(*self.command_args(), source=source, expected=5)
+        self.assertEqual(report["error"]["code"], "SOURCE_INCOMPLETE")
+        self.assertFalse(self.dest.exists())
+        self.assertFalse(self.config.exists())
+        self.assertFalse((self.home / ".codex").exists())
+
+    # ------------------------------------------------------- upgrade/reinstall
+    def test_legacy_receipt_upgrade_restores_artifacts_and_third_install_is_idempotent(self):
+        # A real fresh install creates the current managed tree and receipt.
+        self.run_install(*self.command_args(), expected=0)
+
+        # Preserve user state that reinstallation must not adopt or delete.
+        bridge_path = self.config / "bridge.json"
+        bridge = self.bridge()
+        bridge["user_unknown"] = {"keep": True}
+        bridge_path.write_text(json.dumps(bridge, ensure_ascii=False, indent=2) + "\n",
+                               encoding="utf-8")
+        bridge_before = bridge_path.read_bytes()
+        profile_user = self.config / "profiles" / "codex-dsh" / "user-notes.txt"
+        profile_user.write_text("profile user file\n", encoding="utf-8")
+        profile_user.chmod(0o600)
+        dest_unknown = self.dest / "user-notes.txt"
+        dest_unknown.write_text("skill user file\n", encoding="utf-8")
+        dest_unknown.chmod(0o600)
+
+        # Owned run directories live below dsh_home; reinstall must not touch them.
+        run_dir = self.config / ".codex-dsh-wrapper" / "runs" / "run-sentinel"
+        sentinel_files = {
+            run_dir / "run.json": b'{"sentinel":true}\n',
+            run_dir / "diagnostics" / "status.json": b'{"phase":"sentinel"}\n',
+            run_dir / "evidence" / "note.txt": b"evidence sentinel\n",
+            run_dir / "scratch" / "state.txt": b"scratch sentinel\n",
+        }
+        sentinel_modes: dict[Path, int] = {}
+        for path in (run_dir, run_dir / "diagnostics", run_dir / "evidence",
+                     run_dir / "scratch"):
+            path.mkdir(parents=True, exist_ok=True)
+            path.chmod(0o700)
+            sentinel_modes[path] = 0o700
+        for path, data in sentinel_files.items():
+            path.write_bytes(data)
+            path.chmod(0o600)
+            sentinel_modes[path] = 0o600
+
+        # Simulate the pre-artifacts receipt/dest shape in isolation. This is not
+        # a real v0.1.1 source installation; only the receipt and dest are edited.
+        installed_artifacts = self.dest / "scripts" / "artifacts.py"
+        installed_artifacts.unlink()
+        receipt_path = self.config / "install-receipt.json"
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        self.assertIn("scripts/artifacts.py", receipt["skill"]["files"])
+        del receipt["skill"]["files"]["scripts/artifacts.py"]
+        del receipt["skill"]["modes"]["scripts/artifacts.py"]
+        receipt_path.write_text(json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",
+                                encoding="utf-8")
+
+        # A managed pre-v0.1.1 launcher: root model pins must go, nested and
+        # unknown settings must remain.
+        worker_path = self.launcher_dir() / "worker.toml"
+        old_worker = OLD_LAUNCHER_MARKER + "\n" + textwrap.dedent('''\
+            name = "worker"
+            description = "old worker"
+            developer_instructions = "old worker instructions"
+            model = "native-worker"
+            model_reasoning_effort = "xhigh"
+            service_tier = "priority"
+            unknown_key = "keep-worker"
+            permissions = { read = true, write = false }
+
+            [nested]
+            model = "nested-model"
+            service_tier = "nested-tier"
+            ''')
+        worker_path.write_text(old_worker, encoding="utf-8")
+        worker_path.chmod(0o640)
+
+        # Upgrade: restore the newly required module and migrate the launcher.
+        _, report = self.run_install("--enable-global-routing", *self.command_args(),
+                                     expected=0)
+        self.assertTrue(report["skill_changed"])
+        self.assertIn("scripts/artifacts.py", report["files_installed"])
+        self.assertEqual(report["global_routing"]["status"], "PASS")
+        self.assertEqual(report["global_routing"]["migrated_launchers"], ["worker"])
+
+        source_artifacts = self.source / "scripts" / "artifacts.py"
+        digest = sha256(source_artifacts)
+        self.assertEqual(sha256(installed_artifacts), digest)
+        self.assert_mode(installed_artifacts, 0o755)
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        metadata = receipt["skill"]["files"]["scripts/artifacts.py"]
+        self.assertEqual(metadata["sha256"], digest)
+        self.assertEqual(metadata["source_sha256"], digest)
+        self.assertEqual(metadata["installed_sha256"], digest)
+        self.assertEqual(metadata["size"], source_artifacts.stat().st_size)
+        self.assertEqual(receipt["skill"]["modes"]["scripts/artifacts.py"], 0o755)
+
+        self.assertEqual(bridge_path.read_bytes(), bridge_before)
+        self.assertEqual(self.bridge()["user_unknown"], {"keep": True})
+        self.assertEqual(profile_user.read_bytes(), b"profile user file\n")
+        self.assertEqual(dest_unknown.read_bytes(), b"skill user file\n")
+        self.assertEqual(report["profiles_initialized"], [])
+        self.assertEqual(report["profiles_preserved"], ["codex-dsh", "codex-dsh-review"])
+
+        worker_text = worker_path.read_text(encoding="utf-8")
+        self.assertEqual(worker_text.splitlines()[0], NEW_LAUNCHER_MARKER)
+        self.assertNotIn(OLD_LAUNCHER_MARKER, worker_text)
+        self.assertNotIn('model = "native-worker"', worker_text)
+        self.assertNotIn('model_reasoning_effort = "xhigh"', worker_text)
+        self.assertNotIn('service_tier = "priority"', worker_text)
+        self.assertIn('unknown_key = "keep-worker"', worker_text)
+        self.assertIn('permissions = { read = true, write = false }', worker_text)
+        self.assertIn("[nested]", worker_text)
+        self.assertIn('model = "nested-model"', worker_text)
+        self.assertIn('service_tier = "nested-tier"', worker_text)
+        self.assert_no_native_pins(worker_text, "worker.toml")
+        self.assert_mode(worker_path, 0o640)
+
+        for path, mode in sentinel_modes.items():
+            self.assert_mode(path, mode)
+        for path, data in sentinel_files.items():
+            self.assertEqual(path.read_bytes(), data)
+
+        # Third installation is functionally idempotent: no skill/global writes,
+        # no backups, and all user and managed state stays byte-identical.
+        skill_snapshot = {
+            path.relative_to(self.dest).as_posix():
+                (stat.S_IMODE(path.stat().st_mode), path.read_bytes())
+            for path in self.dest.rglob("*") if path.is_file()
+        }
+        receipt_before = json.loads(receipt_path.read_text(encoding="utf-8"))
+        _, report = self.run_install("--enable-global-routing", *self.command_args(),
+                                     expected=0)
+        self.assertFalse(report["skill_changed"])
+        self.assertTrue(report["files_unchanged"])
+        self.assertEqual(report["files_installed"], [])
+        self.assertEqual(report["backups"], [])
+        self.assertEqual(report["global_routing"]["applied"], [])
+        self.assertEqual(report["global_routing"]["migrated_launchers"], [])
+        for rel, (mode, data) in skill_snapshot.items():
+            path = self.dest / rel
+            self.assertEqual(path.read_bytes(), data, rel)
+            self.assert_mode(path, mode)
+        self.assert_mode(self.dest, 0o755)
+        self.assertEqual(bridge_path.read_bytes(), bridge_before)
+        self.assertEqual(worker_path.read_text(encoding="utf-8"), worker_text)
+        self.assertEqual(profile_user.read_bytes(), b"profile user file\n")
+        self.assertEqual(dest_unknown.read_bytes(), b"skill user file\n")
+        receipt_after = json.loads(receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual(receipt_after["skill"]["files"], receipt_before["skill"]["files"])
+        self.assertEqual(receipt_after["skill"]["modes"], receipt_before["skill"]["modes"])
+        self.assertEqual(receipt_after["skill"]["files"]["scripts/artifacts.py"]["sha256"],
+                         digest)
+        self.assertEqual(receipt_after["skill"]["modes"]["scripts/artifacts.py"], 0o755)
+        for path, mode in sentinel_modes.items():
+            self.assert_mode(path, mode)
+        for path, data in sentinel_files.items():
+            self.assertEqual(path.read_bytes(), data)
+
     # --------------------------------------------------------------- migration
     def test_schema1_requires_explicit_migration_and_is_idempotent(self):
         old = {

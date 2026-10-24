@@ -389,7 +389,7 @@ def _collect_source(root: Path) -> tuple[dict[str, bytes], dict[str, int]]:
         modes[rel] = 0o755 if rel.startswith("scripts/") and rel.endswith(".py") else 0o644
     required = {"SKILL.md", "references/usage.md", "agents/openai.yaml",
                 "scripts/run_dsh.py", "scripts/doctor.py", "scripts/supervision.py",
-                "scripts/manage_dsh.py"}
+                "scripts/manage_dsh.py", "scripts/artifacts.py"}
     if not required.issubset(files):
         raise InstallError("SOURCE_INCOMPLETE", "The source tree is missing required skill files.", 5)
     return files, modes

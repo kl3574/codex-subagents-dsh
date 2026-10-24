@@ -21,7 +21,10 @@ description: 把明确、限定范围的子任务通过普通 Codex subagent 交
    实际任务模型由 Harness profile 选择。若启动器先报模型不受支持，先检查原生
    角色或全局默认配置；这时尚未进入 Harness。全局安装与旧角色迁移见
    [README](README.md)。
-3. 发送完整消息；技能位置取自已加载技能的 base directory，路径按
+3. 先用 `scripts/manage_dsh.py prepare --config CONFIG --cwd CWD` 创建独立受管运行，
+   再把返回的 `run_dir` 和 `status_file` 交给启动器。仓库文件、借用输入和最终交付物
+   不属于 scratch；恢复所需材料保留到明确收尾。详见
+   [产物收尾](references/artifact-lifecycle.md)。发送完整消息；技能位置取自已加载技能的 base directory，路径按
    `Path.home()` 动态解析：
 
    ```text
@@ -34,10 +37,12 @@ description: 把明确、限定范围的子任务通过普通 Codex subagent 交
    本次 patches：<按应用顺序列出绝对路径；默认空>
    session_id：<新会话省略；恢复时用上次返回值>
    timeout：<显式硬预算秒数；省略时使用 bridge 的 hard_timeout_seconds（默认 null）>
-   status_file：<主 agent 指定的新绝对路径；建议提供以便持续观察>
+   run_dir：<prepare 返回的受管目录>
+   status_file：<prepare 返回的状态路径>
    允许操作：<具体文件/目录与允许的命令>
    验收条件：<实际产物或可核验结果>
-   将任务写入 0600 的 UTF-8 临时文件，直接运行 scripts/run_dsh.py；
+   将任务通过 stdin 或 run_dir/scratch 中 0600 的 UTF-8 文件传入 scripts/run_dsh.py；
+   必须传 --run-dir；
    等待结束并返回完整结构化结果，不要代写目标产物。
    ```
 
@@ -48,6 +53,11 @@ description: 把明确、限定范围的子任务通过普通 Codex subagent 交
 5. 独立检查实际文件、差异或命令结果，分别报告 **Harness 完成状态**、
    **任务验收状态** 和 **未解决的工具错误**。`harness_completed` 只表示执行层完成，
    不证明验收通过；认证或模型请求失败时不要自动重试业务请求。
+6. 验收并交付后，由主 agent 执行 `manage_dsh.py finalize --run-dir DIR
+   --disposition accepted --delivered`；明确放弃时使用 `--disposition abandoned`。
+   这是主 agent 的正常收尾步骤，无需另请用户逐次批准。待验收、失败、取消、超时
+   与 UNKNOWN 运行保留恢复材料；UNKNOWN 不能破坏性收尾。检查收尾记录中的清理状态，
+   将清理问题与 Harness 执行结果、任务验收分别报告。
 
 没有原生 subagent 工具时，可以安装、诊断和直接运行 Harness，但原生委派验收标为
 `NOT_VERIFIED`；直接执行证据不能替代原生 subagent 证据。
@@ -56,18 +66,22 @@ description: 把明确、限定范围的子任务通过普通 Codex subagent 交
 
 1. 读 [references/usage.md](references/usage.md)，保持主 agent 的权限、范围、
    审批、网络代理和环境策略。
-2. 将任务写入 UTF-8 文件，直接运行脚本，不再委派：
+2. 使用主 agent 提供的受管目录；若尚未提供，先 prepare 并回报目录。将任务通过
+   stdin 或该目录的 scratch 文件传入脚本，不再委派：
 
    ```bash
    python3 <skill-dir>/scripts/run_dsh.py \
      --config "$HOME/.dsh-codex/bridge.json" \
      --cwd /absolute/task/workspace \
-     --task-file /absolute/private-task.txt
+     --run-dir /absolute/owned/run \
+     --task-file /absolute/owned/run/scratch/task.txt
    ```
 
    可选 `--profile NAME`、重复有序的 `--patch /absolute/file.yml`、
-   `--session-id ID`、显式 `--timeout SECONDS` 和 `--status-file ABSOLUTE_NEW_PATH`。
+   `--session-id ID` 和显式 `--timeout SECONDS`；受管状态路径自动选择，若显式传
+   `--status-file`，必须使用 prepare 返回的路径。仅旧的未受管调用可另选新路径。
    默认 profile 与 `default_patches` 来自 bridge；本次覆盖不写回 profile。
 3. 返回完整结构化结果及必要摘要，不输出 `.env`、完整环境、认证头或密钥。
    恢复 session 时保持相同 DSH_HOME、cwd、profile 和有序 patches；不自动重跑
    未知状态的模型请求，不自行代写目标产物。
+   启动器保留受管文件，交由主 agent 验收后 finalize。

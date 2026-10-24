@@ -26,6 +26,7 @@ secret-redacted.
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import ctypes
 import hashlib
 import json
@@ -49,6 +50,7 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 import supervision as sup  # noqa: E402  (same directory; script/direct import)
+import artifacts  # noqa: E402
 
 EXIT_CODES = {"config": 2, "launch": 3, "authentication": 4, "protocol": 5,
               "timeout": 6, "interrupted": 7, "harness": 8, "limit": 9,
@@ -129,6 +131,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="explicit hard execution budget in positive seconds")
     parser.add_argument("--status-file",
                         help="absolute path for a new 0600 bounded status JSON file")
+    parser.add_argument("--run-dir", help="owned directory returned by manage_dsh.py prepare")
     return parser
 
 
@@ -1073,6 +1076,7 @@ def _base_result() -> dict[str, Any]:
                          "requested_at": None, "acted": False},
         "diagnostics": [], "log_degraded": False, "log_truncated": False,
         "log_dropped_events": 0, "log_diagnostics": [],
+        "artifacts": {"state": "unmanaged", "acceptance": "pending"},
     }
 
 
@@ -1810,6 +1814,13 @@ def _terminal_state(error: dict[str, Any] | None) -> str:
 
 
 def execute(args: argparse.Namespace) -> dict[str, Any]:
+    # Public execute() can run in a long-lived process. Release the artifact
+    # lease even if final result/log serialization raises unexpectedly.
+    with ExitStack() as resources:
+        return _execute(args, resources)
+
+
+def _execute(args: argparse.Namespace, resources: ExitStack) -> dict[str, Any]:
     started = time.monotonic()
     result = _base_result()
     prepared: Prepared | None = None
@@ -1828,8 +1839,24 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     log_init_error = None
     supervision_completed = False
     run_id = None
+    artifact_lease = None
+    artifact_started = False
     try:
         prepared = prepare(args)
+        supervisor_identity = sup.process_identity(os.getpid())
+        if getattr(args, "run_dir", None) is not None:
+            artifact_lease = artifacts.RunLease(args.run_dir)
+            resources.callback(artifact_lease.close)
+            owned_status = artifact_lease.path / "diagnostics" / "status.json"
+            if prepared.status_file is not None and prepared.status_file != owned_status:
+                raise artifacts.ArtifactError("ARTIFACT_STATUS_CONFLICT")
+            artifact_lease.begin(prepared.dsh_home, prepared.cwd, supervisor_identity)
+            artifact_started = True
+            prepared.status_file = owned_status
+            prepared.log_root = artifact_lease.path / "diagnostics"
+            for name in ("scratch", "evidence"):
+                prepared.env["CODEX_DSH_" + name.upper() + "_DIR"] = str(artifact_lease.path / name)
+            prepared.env["CODEX_DSH_RUN_DIR"] = str(artifact_lease.path)
         result.update({
             "profile": prepared.profile,
             "patches": [str(p) for p in prepared.patches],
@@ -1846,7 +1873,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         })
         if os.name != "posix":
             raise BridgeError("config", "PLATFORM_NOT_VERIFIED")
-        run_id = uuid.uuid4().hex
+        run_id = artifact_lease.document["run_id"] if artifact_lease else uuid.uuid4().hex
         result["run_id"] = run_id
         state = _new_run_state(prepared)
         supervisor_identity = sup.process_identity(os.getpid())
@@ -1870,6 +1897,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 raise BridgeError(status_error["category"], status_error["code"]) from None
         try:
             logs = BoundedLog(prepared.log_root, prepared.limits["max_log_bytes"])
+            resources.callback(logs.close)
             result["log_dir"] = str(logs.path)
         except (OSError, ValueError):
             logs = None
@@ -1907,6 +1935,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                     stop_signal["signum"] = signum
             for signum in (signal.SIGTERM, signal.SIGINT):
                 old_signals[signum] = signal.signal(signum, on_signal)
+                resources.callback(signal.signal, signum, old_signals[signum])
         old_subreaper = _subreaper(True)
         try:
             process = subprocess.Popen(prepared.command, cwd=prepared.cwd, env=prepared.env,
@@ -1922,6 +1951,8 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         child_identity = outcome.get("child_identity")
     except BridgeError as exc:
         error = exc.diagnostic
+    except artifacts.ArtifactError as exc:
+        error = diagnostic("config", exc.code)
     except (KeyboardInterrupt, Interrupted):
         error = diagnostic("interrupted", "EXECUTION_INTERRUPTED")
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
@@ -2143,6 +2174,13 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         result["diagnostics"] = _diagnostics_snapshot(
             state or {}, parser, error, [finish_error] if (
                 finish_error is not None and error is not finish_error) else None)
+        if artifact_lease is not None and artifact_started:
+            try:
+                result["artifacts"] = artifact_lease.finish(result)
+            except (artifacts.ArtifactError, OSError, ValueError):
+                result["artifacts"] = {"state": "unknown", "acceptance": "pending",
+                                       "run_dir": str(artifact_lease.path),
+                                       "housekeeping_error": "ARTIFACT_RECORD_FAILED"}
         # Logs are retention, not execution control: failures degrade the log
         # and never rewrite a healthy task result into a log-limit failure.
         if logs is not None:
@@ -2168,6 +2206,8 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                                          ["LOG_DIR_UNAVAILABLE"])
         for signum, previous in old_signals.items():
             signal.signal(signum, previous)
+        if artifact_lease is not None:
+            artifact_lease.close()
     return result
 
 

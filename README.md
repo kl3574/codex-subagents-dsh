@@ -9,6 +9,10 @@ Version: **v0.1.1**. Ordinary runs have no default total deadline. Quiet periods
 produce observations; explicit budgets, cancellation and confirmed execution errors
 have separate outcomes.
 
+This development checkout adds owned-run lifecycle commands on top of v0.1.1;
+those commands are not included in the v0.1.1 release tag. Install from this checkout
+to use them. No new release tag is implied.
+
 ## What it provides
 
 - A short delegation workflow in [`SKILL.md`](SKILL.md).
@@ -148,6 +152,8 @@ do not automatically replay the task as a workaround.
 Existing profiles and patches are never reset. Only missing profile directories are
 initialized. `.env` files are neither copied into the skill nor modified in the
 private config directory.
+Runtime artifacts live under the configured `DSH_HOME/.codex-dsh-wrapper/runs/`.
+The installer neither copies nor collects them; upgrading does not trigger historical GC.
 
 ## Verification
 
@@ -184,19 +190,32 @@ for the tested version and results. `harness_completed` does not mean task accep
 ## Run a task
 
 The full operating guide, progress semantics, error codes, and recovery rules are in
-[`references/usage.md`](references/usage.md). A minimal invocation:
+[`references/usage.md`](references/usage.md). First prepare an owned run, then use
+the returned `run_dir` in the execution command:
 
 ```bash
+python3 "$HOME/.agents/skills/codex-subagents-dsh/scripts/manage_dsh.py" prepare \
+  --config "$HOME/.dsh-codex/bridge.json" --cwd /absolute/task/workspace
+
 python3 "$HOME/.agents/skills/codex-subagents-dsh/scripts/run_dsh.py" \
   --config "$HOME/.dsh-codex/bridge.json" \
   --cwd /absolute/task/workspace \
-  --task-file /absolute/private-task.txt
+  --run-dir /absolute/owned/run \
+  --task-file /absolute/owned/run/scratch/task.txt
 ```
 
 Add `--profile`, repeated `--patch`, `--session-id`, `--timeout`, and the
-main-agent-chosen status file as needed. Explicit `--timeout` is a hard budget;
+prepare-returned status file as needed. Explicit `--timeout` is a hard budget;
 bridge `hard_timeout_seconds` defaults to `null`, so ordinary runs are not silently
 killed by a wall-clock deadline.
+
+Harness completion leaves acceptance pending. After independent acceptance and delivery,
+the main agent runs `manage_dsh.py finalize --run-dir DIR --disposition accepted --delivered`.
+Explicit abandonment uses `--disposition abandoned`; failed or UNKNOWN work retains recovery
+material. Finalize reclaims owned scratch. Ordinary diagnostics become eligible seven days
+after closeout, with bounded automatic passes and `gc --dry-run` / `gc` commands.
+See [artifact lifecycle](references/artifact-lifecycle.md) for protection, retries and
+housekeeping warnings. Legacy calls without `--run-dir` remain unmanaged.
 
 ## Repository layout
 
@@ -209,7 +228,8 @@ scripts/install.py       preserve-first installer and migration
 scripts/test_install.py  isolated fake-dsh installer tests
 scripts/run_dsh.py       headless launcher with schema-2 supervision
 scripts/supervision.py   bounded status/control helpers
-scripts/manage_dsh.py    owner status and cancel-request entry point
+scripts/manage_dsh.py    prepare, finalize, GC, status and cancellation CLI
+scripts/artifacts.py     owned run leases and bounded artifact housekeeping
 scripts/doctor.py        readiness checks without a model request
 examples/                public managed-block and launcher templates
 ```

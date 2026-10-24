@@ -14,10 +14,15 @@ defines the task, permissions, cwd, acceptance criteria, and independently verif
   that startup failure separately and inspect the launcher or global defaults.
 - Use an ordinary native Codex subagent launcher. Pass the full task, absolute cwd, allowed
   operations, acceptance criteria, and optional profile, ordered patches, session, timeout,
-  and the main-agent-chosen status file.
+  and the owned run directory/status file returned by `manage_dsh.py prepare`.
 - Keep `explorer` read-only and `worker` limited to authorized changes. The launcher prepares
   the task, starts the process, waits, queries or cancels through the owner entry point, and
   returns evidence. It does not recursively delegate or write the target artifact itself.
+- Prepare one owned run per invocation and pass `--run-dir`. Put temporary inputs in its
+  scratch directory or use stdin. After independent acceptance and delivery, the main agent
+  runs `manage_dsh.py finalize --run-dir DIR --disposition accepted --delivered`; explicit
+  abandonment uses `--run-dir DIR --disposition abandoned`. Preserve recovery material while pending or UNKNOWN. Check
+  housekeeping warnings separately; ordinary closed-run diagnostics have seven-day retention.
 - Report Harness completion separately from task acceptance. Do not automatically replay an
   unknown model request or treat a heartbeat as task progress. Without a native subagent tool,
   native delegation is NOT_VERIFIED.
