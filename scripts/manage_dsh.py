@@ -30,6 +30,7 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 import supervision as sup  # noqa: E402
+import artifacts  # noqa: E402
 
 MANAGE_EXIT = {"ok": 0, "usage": 2, "status": 3, "not_live": 4, "control": 5}
 
@@ -50,6 +51,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser = JsonArgumentParser(prog="manage_dsh.py", description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True,
                                        parser_class=JsonArgumentParser)
+    prepare = subparsers.add_parser("prepare", help="create an owned run directory without starting Harness")
+    prepare.add_argument("--config", required=True)
+    prepare.add_argument("--cwd", required=True)
+    finalize = subparsers.add_parser("finalize", help="record main-agent closeout and reclaim owned scratch")
+    finalize.add_argument("--run-dir", required=True)
+    finalize.add_argument("--disposition", required=True, choices=["accepted", "abandoned"])
+    finalize.add_argument("--delivered", action="store_true")
+    finalize.add_argument("--dry-run", action="store_true")
+    finalize.add_argument("--expected-plan")
     status = subparsers.add_parser("status", help="read and verify a status file")
     status.add_argument("--status-file", required=True)
     cancel = subparsers.add_parser("cancel", help="write a run_id-scoped cancel request")
@@ -178,13 +188,22 @@ def command_cancel(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
 def main(argv: list[str] | None = None) -> int:
     try:
         args = build_parser().parse_args(argv)
-        if args.command == "status":
+        if args.command == "prepare":
+            try:
+                response, code = artifacts.prepare_run(args.config, args.cwd), 0
+            except artifacts.ArtifactError as exc:
+                raise ManageError(exc.code, "config") from None
+        elif args.command == "status":
             response, code = command_status(args)
+        elif args.command == "finalize":
+            response = artifacts.finalize_run(args.run_dir, args.disposition, args.delivered,
+                                              args.dry_run, args.expected_plan)
+            code = 0 if response["ok"] else 6
         elif args.command == "cancel":
             response, code = command_cancel(args)
         else:
             raise ManageError("ARGUMENT_INVALID", "config")
-    except ManageError as exc:
+    except (ManageError, artifacts.ArtifactError) as exc:
         response = {
             "ok": False,
             "tool": "manage_dsh",
